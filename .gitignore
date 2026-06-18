@@ -1,0 +1,10 @@
+git .venv/
+__pycache__/
+*.py[cod]
+.cache/
+data/physical/*.json
+data/functional/*.jsonl
+data/otbi/*.json
+data/rest/*.json
+data/graph/*.json
+!data/**/.gitkeep

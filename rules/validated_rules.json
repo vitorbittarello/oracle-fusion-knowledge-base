@@ -1,0 +1,99 @@
+{
+  "version": "1.0.0",
+  "generated_at": "2026-06-16T00:00:00+00:00",
+  "rules": [
+    {
+      "id": "ppm.current_approved_budget_version",
+      "name": "Selecionar a versão atual do orçamento aprovado por projeto",
+      "description": "Regra validada no ambiente para localizar a versão vigente e aprovada do orçamento de cada projeto, eliminando versões não concluídas e escolhendo deterministicamente a versão mais recente.",
+      "business_entity": "approved_budget_version",
+      "rule_type": "validated_selection_and_ranking",
+      "tables": [
+        "PJO_PLAN_VERSIONS_VL",
+        "PJF_PROJECTS_ALL_B"
+      ],
+      "columns": [
+        "PJO_PLAN_VERSIONS_VL.PROJECT_ID",
+        "PJO_PLAN_VERSIONS_VL.PLAN_CLASS_CODE",
+        "PJO_PLAN_VERSIONS_VL.PLAN_STATUS_CODE",
+        "PJO_PLAN_VERSIONS_VL.CURRENT_PLAN_STATUS_FLAG",
+        "PJO_PLAN_VERSIONS_VL.PROCESSING_TIME",
+        "PJO_PLAN_VERSIONS_VL.VERSION_NUMBER",
+        "PJO_PLAN_VERSIONS_VL.LAST_UPDATE_DATE",
+        "PJF_PROJECTS_ALL_B.PROJECT_ID",
+        "PJF_PROJECTS_ALL_B.SEGMENT1"
+      ],
+      "joins": [
+        {
+          "left": "PJO_PLAN_VERSIONS_VL.PROJECT_ID",
+          "operator": "=",
+          "right": "PJF_PROJECTS_ALL_B.PROJECT_ID",
+          "purpose": "Associar a versão do plano ao projeto e recuperar o número do projeto."
+        }
+      ],
+      "conditions": [
+        {
+          "column": "PJO_PLAN_VERSIONS_VL.PLAN_CLASS_CODE",
+          "operator": "=",
+          "value": "BUDGET",
+          "meaning": "Restringe o plano à classe de orçamento."
+        },
+        {
+          "column": "PJO_PLAN_VERSIONS_VL.PLAN_STATUS_CODE",
+          "operator": "=",
+          "value": "B",
+          "meaning": "Restringe a versões em baseline/aprovadas conforme a validação funcional realizada."
+        },
+        {
+          "column": "PJO_PLAN_VERSIONS_VL.CURRENT_PLAN_STATUS_FLAG",
+          "operator": "=",
+          "value": "Y",
+          "meaning": "Mantém a versão vigente no estado atual."
+        },
+        {
+          "column": "PJO_PLAN_VERSIONS_VL.PROCESSING_TIME",
+          "operator": "IS NOT NULL",
+          "meaning": "Exclui versões cujo processamento não foi concluído."
+        }
+      ],
+      "result_grain": {
+        "description": "Uma linha por PROJECT_ID.",
+        "grain_columns": [
+          "PJO_PLAN_VERSIONS_VL.PROJECT_ID"
+        ]
+      },
+      "ranking": {
+        "partition_by": [
+          "PJO_PLAN_VERSIONS_VL.PROJECT_ID"
+        ],
+        "order_by": [
+          {
+            "column": "PJO_PLAN_VERSIONS_VL.VERSION_NUMBER",
+            "direction": "DESC"
+          },
+          {
+            "column": "PJO_PLAN_VERSIONS_VL.LAST_UPDATE_DATE",
+            "direction": "DESC"
+          }
+        ],
+        "filter": "ROW_NUMBER() = 1",
+        "warning": "Não usar OBJECT_VERSION_NUMBER como versão funcional do orçamento."
+      },
+      "sql_template": "WITH candidatos AS (\n    SELECT\n        p.project_id,\n        prj.segment1 AS numero_projeto,\n        p.version_name AS nome_versao,\n        p.version_number,\n        p.total_pc_raw_cost AS custo_bruto_moeda_projeto,\n        p.last_update_date,\n        p.plan_version_id\n    FROM {physical_schema}.pjo_plan_versions_vl p\n    INNER JOIN {physical_schema}.pjf_projects_all_b prj\n        ON prj.project_id = p.project_id\n    WHERE p.plan_class_code = 'BUDGET'\n      AND p.plan_status_code = 'B'\n      AND p.current_plan_status_flag = 'Y'\n      AND p.processing_time IS NOT NULL\n), ranqueados AS (\n    SELECT\n        c.*,\n        ROW_NUMBER() OVER (\n            PARTITION BY c.project_id\n            ORDER BY c.version_number DESC, c.last_update_date DESC\n        ) AS rn\n    FROM candidatos c\n)\nSELECT *\nFROM ranqueados\nWHERE rn = 1",
+      "validation": {
+        "status": "validated_in_environment",
+        "validated_by": "user",
+        "validation_date": "2026-06-16",
+        "environment": "dmfinan_silver",
+        "notes": "A regra foi consolidada após validação da consulta no ambiente real."
+      },
+      "source": {
+        "origin": "validated_sql",
+        "release": "26B",
+        "module_id": "ppm"
+      },
+      "confidence": "very_high",
+      "module_id": "ppm"
+    }
+  ]
+}

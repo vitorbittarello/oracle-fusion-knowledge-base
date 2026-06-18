@@ -1,0 +1,100 @@
+{
+  "release": "26B",
+  "functional_guides": [
+    {
+      "guide_id": "oapfm",
+      "title": "Implementing Project Financial Management and Grants Management",
+      "toc_url": "https://docs.oracle.com/en/cloud/saas/project-management/26b/oapfm/toc.htm",
+      "release": "26B",
+      "business_domains": [
+        "project foundation",
+        "project control",
+        "budget",
+        "forecast",
+        "costing",
+        "billing",
+        "grants"
+      ],
+      "exclude_patterns": [
+        "copyright",
+        "about-the-guide"
+      ],
+      "module_id": "ppm",
+      "module_name": "Project Management"
+    },
+    {
+      "guide_id": "oapjf",
+      "title": "Defining and Managing Financial Projects",
+      "toc_url": "https://docs.oracle.com/en/cloud/saas/project-management/26b/oapjf/toc.htm",
+      "release": "26B",
+      "business_domains": [
+        "project",
+        "task",
+        "financial plan",
+        "budget",
+        "forecast",
+        "project performance"
+      ],
+      "exclude_patterns": [
+        "copyright",
+        "about-the-guide"
+      ],
+      "module_id": "ppm",
+      "module_name": "Project Management"
+    },
+    {
+      "guide_id": "oapjc",
+      "title": "Using Project Costing",
+      "toc_url": "https://docs.oracle.com/en/cloud/saas/project-management/26b/oapjc/toc.htm",
+      "release": "26B",
+      "business_domains": [
+        "project costing",
+        "expenditure",
+        "commitment",
+        "burdening",
+        "accounting"
+      ],
+      "exclude_patterns": [
+        "copyright",
+        "about-the-guide"
+      ],
+      "module_id": "ppm",
+      "module_name": "Project Management"
+    },
+    {
+      "guide_id": "faugr",
+      "title": "Using Grants Management",
+      "toc_url": "https://docs.oracle.com/en/cloud/saas/project-management/26b/faugr/toc.htm",
+      "release": "26B",
+      "business_domains": [
+        "grants",
+        "award",
+        "funding",
+        "budget",
+        "project"
+      ],
+      "exclude_patterns": [
+        "copyright",
+        "about-the-guide"
+      ],
+      "module_id": "ppm",
+      "module_name": "Project Management"
+    }
+  ],
+  "otbi": {
+    "title": "Subject Areas for Transactional Business Intelligence in Project Management",
+    "toc_url": "https://docs.oracle.com/en/cloud/saas/project-management/26b/faopm/toc.htm",
+    "release": "26B",
+    "source_id": "ppm_otbi",
+    "module_id": "ppm",
+    "module_name": "Project Management"
+  },
+  "rest": {
+    "title": "REST API for Oracle Fusion Cloud Project Management",
+    "toc_url": "https://docs.oracle.com/en/cloud/saas/project-management/26b/fapap/toc.htm",
+    "release": "26B",
+    "source_id": "ppm_rest",
+    "module_id": "ppm",
+    "module_name": "Project Management"
+  }
+}

@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "oracle-fusion-knowledge-base"
+version = "2.0.0"
+description = "Coletores multi-módulo, grafo de conhecimento e busca híbrida para Oracle Fusion Cloud Applications"
+requires-python = ">=3.10"
+dependencies = [
+    "beautifulsoup4>=4.12,<5",
+    "requests>=2.31,<3",
+    "urllib3>=2.2,<3"
+]
+
+[tool.setuptools.packages.find]
+include = ["oracle_knowledge*"]

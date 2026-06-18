@@ -1,0 +1,204 @@
+{
+  "version": "1.0.0",
+  "entities": [
+    {
+      "entity_id": "project",
+      "name": "Financial Project",
+      "aliases": [
+        "project",
+        "financial project",
+        "projeto",
+        "projeto financeiro",
+        "project number",
+        "project name"
+      ],
+      "description": "Projeto financeiro e seus atributos fundamentais.",
+      "business_domains": [
+        "project foundation",
+        "project control"
+      ],
+      "tables": [
+        "PJF_PROJECTS_ALL_B",
+        "PJF_PROJECTS_ALL_TL",
+        "PJF_PROJECTS_ALL_VL"
+      ],
+      "subject_areas": [
+        "Project Control - Budgets Real Time",
+        "Project Control - Forecasts Real Time",
+        "Project Control - Financial Project Plans Real Time"
+      ],
+      "rest_resources": [
+        "Projects",
+        "Project Plans"
+      ],
+      "module_id": "ppm"
+    },
+    {
+      "entity_id": "project_task",
+      "name": "Project Task",
+      "aliases": [
+        "project task",
+        "task",
+        "tarefa",
+        "tarefa do projeto",
+        "work breakdown structure",
+        "wbs"
+      ],
+      "description": "Elemento de estrutura e execução pertencente a um projeto.",
+      "business_domains": [
+        "project foundation",
+        "planning"
+      ],
+      "tables": [
+        "PJF_PROJ_ELEMENTS_B",
+        "PJF_PROJ_ELEMENTS_TL"
+      ],
+      "subject_areas": [
+        "Project Control - Financial Project Plans Real Time",
+        "Project Control - Budgets Real Time"
+      ],
+      "rest_resources": [
+        "Project Plans",
+        "Tasks"
+      ],
+      "module_id": "ppm"
+    },
+    {
+      "entity_id": "financial_plan_version",
+      "name": "Financial Plan Version",
+      "aliases": [
+        "financial plan version",
+        "plan version",
+        "versão do plano financeiro",
+        "planning version"
+      ],
+      "description": "Versão de planejamento financeiro de projeto, incluindo orçamento e previsão.",
+      "business_domains": [
+        "project control",
+        "financial planning"
+      ],
+      "tables": [
+        "PJO_PLAN_VERSIONS_B",
+        "PJO_PLAN_VERSIONS_TL",
+        "PJO_PLAN_VERSIONS_VL"
+      ],
+      "subject_areas": [
+        "Project Control - Budgets Real Time",
+        "Project Control - Forecasts Real Time",
+        "Project Control - Financial Project Plans Real Time"
+      ],
+      "rest_resources": [
+        "Project Budgets",
+        "Project Forecasts"
+      ],
+      "module_id": "ppm"
+    },
+    {
+      "entity_id": "approved_budget_version",
+      "name": "Approved Budget Version",
+      "aliases": [
+        "approved budget",
+        "approved budget version",
+        "current approved budget",
+        "orçamento aprovado",
+        "versão aprovada do orçamento",
+        "baseline budget"
+      ],
+      "description": "Versão de orçamento aprovada e vigente de um projeto.",
+      "business_domains": [
+        "project control",
+        "budget"
+      ],
+      "tables": [
+        "PJO_PLAN_VERSIONS_VL",
+        "PJF_PROJECTS_ALL_B"
+      ],
+      "subject_areas": [
+        "Project Control - Budgets Real Time"
+      ],
+      "rest_resources": [
+        "Project Budgets"
+      ],
+      "validated_rules": [
+        "ppm.current_approved_budget_version"
+      ],
+      "module_id": "ppm"
+    },
+    {
+      "entity_id": "forecast_version",
+      "name": "Project Forecast Version",
+      "aliases": [
+        "forecast",
+        "forecast version",
+        "current forecast",
+        "previsão",
+        "versão da previsão"
+      ],
+      "description": "Versão de previsão financeira do projeto.",
+      "business_domains": [
+        "project control",
+        "forecast"
+      ],
+      "tables": [
+        "PJO_PLAN_VERSIONS_VL"
+      ],
+      "subject_areas": [
+        "Project Control - Forecasts Real Time"
+      ],
+      "rest_resources": [
+        "Project Forecasts"
+      ],
+      "module_id": "ppm"
+    },
+    {
+      "entity_id": "project_cost",
+      "name": "Project Cost",
+      "aliases": [
+        "project cost",
+        "actual cost",
+        "expenditure item",
+        "custo do projeto",
+        "custo real",
+        "item de despesa"
+      ],
+      "description": "Custos e itens de despesa capturados para projetos.",
+      "business_domains": [
+        "project costing"
+      ],
+      "tables": [
+        "PJC_EXP_ITEMS_ALL"
+      ],
+      "subject_areas": [
+        "Project Costing - Actual Costs Real Time",
+        "Project Costing - Expenditure Item Performance - Real Time"
+      ],
+      "rest_resources": [
+        "Project Costs",
+        "Unprocessed Project Costs"
+      ],
+      "module_id": "ppm"
+    },
+    {
+      "entity_id": "project_commitment",
+      "name": "Project Commitment",
+      "aliases": [
+        "project commitment",
+        "commitment",
+        "committed cost",
+        "compromisso",
+        "custo comprometido"
+      ],
+      "description": "Compromissos do fluxo de compras associados a projetos.",
+      "business_domains": [
+        "project costing",
+        "procure to pay"
+      ],
+      "tables": [],
+      "subject_areas": [
+        "Project Costing - Commitments Real Time"
+      ],
+      "rest_resources": [],
+      "module_id": "ppm"
+    }
+  ]
+}
