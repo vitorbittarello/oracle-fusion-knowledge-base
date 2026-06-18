@@ -8,3 +8,5 @@ data/otbi/*.json
 data/rest/*.json
 data/graph/*.json
 !data/**/.gitkeep
+
+.idea/
