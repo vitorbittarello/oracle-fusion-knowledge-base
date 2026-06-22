@@ -96,46 +96,185 @@ class HybridSearch:
         lengths = list(self.document_lengths.values())
         self.average_document_length = sum(lengths) / len(lengths) if lengths else 1.0
 
+    @staticmethod
+    def _auxiliary_penalty(
+            node: dict[str, Any],
+            query_tokens: list[str],
+            normalized_query: str,
+    ) -> float:
+        if node.get("node_type") not in {
+            "physical_table",
+            "physical_column",
+        }:
+            return 1.0
+
+        object_name = (
+                node.get("table_name")
+                or node.get("name")
+                or node.get("title")
+                or ""
+        )
+
+        object_name = str(object_name).upper()
+
+        if node.get("node_type") == "physical_column":
+            object_name = str(
+                node.get("table_name")
+                or object_name.split(".", 1)[0]
+            ).upper()
+
+        object_parts = {
+            part
+            for part in object_name.split("_")
+            if part
+        }
+
+        normalized_object_name = normalize_text(object_name)
+
+        explicit_object_search = bool(
+            normalized_object_name
+            and normalized_object_name in normalized_query
+        )
+
+        auxiliary_query_terms = {
+            "archive",
+            "archived",
+            "arquivo",
+            "historico",
+            "historica",
+            "history",
+            "interface",
+            "import",
+            "importacao",
+            "draft",
+            "rascunho",
+            "temporary",
+            "temporaria",
+            "temp",
+            "staging",
+            "stage",
+        }
+
+        auxiliary_intent = bool(
+            set(query_tokens).intersection(
+                auxiliary_query_terms
+            )
+        )
+
+        if explicit_object_search or auxiliary_intent:
+            return 1.0
+
+        if (
+                "INTERFACE" in object_parts
+                or object_name.endswith("_INT")
+                or object_name.endswith("_GT")
+                or object_name.endswith("_TMP")
+                or object_name.endswith("_TEMP")
+                or object_name.endswith("_STG")
+        ):
+            return 0.35
+
+        if "DRAFT" in object_parts:
+            return 0.45
+
+        if (
+                "ARCHIVE" in object_parts
+                or "HISTORY" in object_parts
+                or "HIST" in object_parts
+        ):
+            return 0.55
+
+        return 1.0
+
     def search(
-        self,
-        query: str,
-        *,
-        limit: int = 20,
-        node_types: set[str] | None = None,
-        source_types: set[str] | None = None,
-        module_ids: set[str] | None = None,
-        graph_hops: int | None = None,
+            self,
+            query: str,
+            *,
+            limit: int = 20,
+            node_types: set[str] | None = None,
+            source_types: set[str] | None = None,
+            module_ids: set[str] | None = None,
+            graph_hops: int | None = None,
     ) -> list[dict[str, Any]]:
         query_tokens = tokenize(query)
+
         if not query_tokens:
             return []
+
         normalized_query = normalize_text(query)
         direct_scores: dict[str, dict[str, float]] = {}
 
         for node_id, node in self.nodes.items():
             if node_types and node.get("node_type") not in node_types:
                 continue
-            if module_ids and not module_ids.intersection(set(node.get("modules", []))):
+
+            if module_ids and not module_ids.intersection(
+                    set(node.get("modules", []))
+            ):
                 continue
+
             source_type = node.get("source", {}).get("source_type")
+
             if source_types and source_type not in source_types:
                 continue
 
             bm25 = self._bm25(node_id, query_tokens)
-            keyword = self._keyword_score(node, query_tokens, normalized_query)
-            title = self._title_score(node, query_tokens, normalized_query)
-            base = (
-                self.config.bm25_weight * bm25
-                + self.config.keyword_weight * keyword
-                + self.config.title_weight * title
+
+            keyword = self._keyword_score(
+                node,
+                query_tokens,
+                normalized_query,
             )
+
+            title = self._title_score(
+                node,
+                query_tokens,
+                normalized_query,
+            )
+
+            base = (
+                    self.config.bm25_weight * bm25
+                    + self.config.keyword_weight * keyword
+                    + self.config.title_weight * title
+            )
+
             if base <= 0:
                 continue
 
-            confidence = max(0.35, confidence_to_score(node.get("confidence_score", node.get("confidence"))))
-            source_boost = SOURCE_BOOSTS.get(source_type, 1.0)
-            type_boost = TYPE_BOOSTS.get(node.get("node_type"), 1.0)
-            final_direct = base * confidence * source_boost * type_boost
+            confidence = max(
+                0.35,
+                confidence_to_score(
+                    node.get(
+                        "confidence_score",
+                        node.get("confidence"),
+                    )
+                ),
+            )
+
+            source_boost = SOURCE_BOOSTS.get(
+                source_type,
+                1.0,
+            )
+
+            type_boost = TYPE_BOOSTS.get(
+                node.get("node_type"),
+                1.0,
+            )
+
+            auxiliary_penalty = self._auxiliary_penalty(
+                node,
+                query_tokens,
+                normalized_query,
+            )
+
+            final_direct = (
+                    base
+                    * confidence
+                    * source_boost
+                    * type_boost
+                    * auxiliary_penalty
+            )
+
             direct_scores[node_id] = {
                 "direct": final_direct,
                 "bm25": bm25,
@@ -144,6 +283,7 @@ class HybridSearch:
                 "confidence": confidence,
                 "source_boost": source_boost,
                 "type_boost": type_boost,
+                "auxiliary_penalty": auxiliary_penalty,
             }
 
         if not direct_scores:
@@ -154,48 +294,140 @@ class HybridSearch:
             key=lambda node_id: direct_scores[node_id]["direct"],
             reverse=True,
         )[: self.config.seed_limit]
+
         expansion = self._expand_graph(
             seeds,
             direct_scores,
-            hops=self.config.graph_hops if graph_hops is None else graph_hops,
+            hops=(
+                self.config.graph_hops
+                if graph_hops is None
+                else graph_hops
+            ),
         )
 
         candidate_ids = set(direct_scores) | set(expansion)
         results: list[dict[str, Any]] = []
+
         for node_id in candidate_ids:
             node = self.nodes[node_id]
+
             if node_types and node.get("node_type") not in node_types:
                 continue
-            if module_ids and not module_ids.intersection(set(node.get("modules", []))):
+
+            if module_ids and not module_ids.intersection(
+                    set(node.get("modules", []))
+            ):
                 continue
-            source_type = node.get("source", {}).get("source_type")
+
+            source_type = node.get("source", {}).get(
+                "source_type"
+            )
+
             if source_types and source_type not in source_types:
                 continue
-            direct = direct_scores.get(node_id, {}).get("direct", 0.0)
-            graph_score = expansion.get(node_id, {}).get("score", 0.0)
-            total = direct + self.config.graph_weight * graph_score
+
+            direct = direct_scores.get(
+                node_id,
+                {},
+            ).get(
+                "direct",
+                0.0,
+            )
+
+            graph_score = expansion.get(
+                node_id,
+                {},
+            ).get(
+                "score",
+                0.0,
+            )
+
+            auxiliary_penalty = direct_scores.get(
+                node_id,
+                {},
+            ).get(
+                "auxiliary_penalty",
+            )
+
+            if auxiliary_penalty is None:
+                auxiliary_penalty = self._auxiliary_penalty(
+                    node,
+                    query_tokens,
+                    normalized_query,
+                )
+
+            adjusted_graph_score = (
+                    graph_score
+                    * auxiliary_penalty
+            )
+
+            total = (
+                    direct
+                    + self.config.graph_weight
+                    * adjusted_graph_score
+            )
+
             if total <= 0:
                 continue
+
+            score_breakdown = dict(
+                direct_scores.get(
+                    node_id,
+                    {},
+                )
+            )
+
+            score_breakdown.setdefault(
+                "auxiliary_penalty",
+                auxiliary_penalty,
+            )
+
+            score_breakdown[
+                "adjusted_graph_score"
+            ] = adjusted_graph_score
+
             results.append(
                 {
                     "id": node_id,
                     "score": round(total, 6),
                     "direct_score": round(direct, 6),
                     "graph_score": round(graph_score, 6),
+                    "adjusted_graph_score": round(
+                        adjusted_graph_score,
+                        6,
+                    ),
                     "node_type": node.get("node_type"),
-                    "title": node.get("title") or node.get("name") or node_id,
+                    "title": (
+                            node.get("title")
+                            or node.get("name")
+                            or node_id
+                    ),
                     "summary": self._summary(node),
                     "source": node.get("source", {}),
                     "sources": node.get("sources", []),
                     "modules": node.get("modules", []),
                     "keywords": node.get("keywords", []),
-                    "score_breakdown": direct_scores.get(node_id, {}),
-                    "graph_paths": expansion.get(node_id, {}).get("paths", []),
+                    "score_breakdown": score_breakdown,
+                    "graph_paths": expansion.get(
+                        node_id,
+                        {},
+                    ).get(
+                        "paths",
+                        [],
+                    ),
                     "node": node,
                 }
             )
 
-        results.sort(key=lambda row: (-row["score"], row["title"]))
+        results.sort(
+            key=lambda row: (
+                normalize_text(row["title"])
+                != normalized_query,
+                -row["score"],
+                row["title"],
+            )
+        )
+
         return results[:limit]
 
     def _bm25(self, node_id: str, query_tokens: list[str]) -> float:
@@ -232,16 +464,62 @@ class HybridSearch:
         return overlap + 2.5 * exact_alias + 1.2 * inverse_alias
 
     @staticmethod
-    def _title_score(node: dict[str, Any], query_tokens: list[str], normalized_query: str) -> float:
-        title = normalize_text(node.get("title") or node.get("name") or "")
+    def _title_score(
+            node: dict[str, Any],
+            query_tokens: list[str],
+            normalized_query: str,
+    ) -> float:
+        title = normalize_text(
+            node.get("title")
+            or node.get("name")
+            or ""
+        )
+
         if not title:
             return 0.0
+
         if title == normalized_query:
-            return 5.0
-        if normalized_query in title or title in normalized_query:
+            return 30.0
+
+        qualified_name = normalize_text(
+            node.get("qualified_name")
+            or ""
+        )
+
+        if qualified_name and qualified_name == normalized_query:
+            return 30.0
+
+        name = normalize_text(
+            node.get("name")
+            or ""
+        )
+
+        if name and name == normalized_query:
+            return 30.0
+
+        if normalized_query and title.startswith(f"{normalized_query}."):
+            return 2.5
+
+        if normalized_query and title.startswith(f"{normalized_query} "):
+            return 2.5
+
+        if normalized_query in title:
+            return 2.0
+
+        if title in normalized_query:
             return 3.0
+
         title_tokens = set(tokenize(title))
-        return 1.5 * len(title_tokens.intersection(query_tokens)) / max(1, len(set(query_tokens)))
+        distinct_query_tokens = set(query_tokens)
+
+        if not title_tokens or not distinct_query_tokens:
+            return 0.0
+
+        overlap = len(
+            title_tokens.intersection(distinct_query_tokens)
+        )
+
+        return 1.5 * overlap / len(distinct_query_tokens)
 
     def _expand_graph(
         self,

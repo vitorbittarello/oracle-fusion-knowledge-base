@@ -409,26 +409,56 @@ class GraphBuilder:
     def load_entities(self, path: str | None) -> None:
         if not path:
             return
-        self.loaded_sources.append({"kind": "entities", "path": str(path)})
+
+        self.loaded_sources.append(
+            {
+                "kind": "entities",
+                "path": str(path),
+            }
+        )
+
         payload = read_json(path, {})
+
         for entity in payload.get("entities", []):
             entity_key = entity["entity_id"]
-            entity_node_id = stable_id("entity", entity_key)
+            entity_node_id = stable_id(
+                "entity",
+                entity_key,
+            )
+
             node = {
                 "id": entity_node_id,
                 "node_type": "business_entity",
                 "entity_id": entity_key,
-                "name": entity.get("name", entity_key),
-                "title": entity.get("name", entity_key),
-                "aliases": entity.get("aliases", []),
-                "description": entity.get("description"),
-                "business_domains": entity.get("business_domains", []),
-                "module_id": entity.get("module_id"),
+                "name": entity.get(
+                    "name",
+                    entity_key,
+                ),
+                "title": entity.get(
+                    "name",
+                    entity_key,
+                ),
+                "aliases": entity.get(
+                    "aliases",
+                    [],
+                ),
+                "description": entity.get(
+                    "description"
+                ),
+                "business_domains": entity.get(
+                    "business_domains",
+                    [],
+                ),
+                "module_id": entity.get(
+                    "module_id"
+                ),
                 "confidence": "high",
                 "source": {
                     "source_type": "curated_entity_map",
                     "entity_aliases_path": str(path),
-                    "module_id": entity.get("module_id"),
+                    "module_id": entity.get(
+                        "module_id"
+                    ),
                 },
                 "search_text": merge_text_fields(
                     entity_key,
@@ -438,31 +468,173 @@ class GraphBuilder:
                     entity.get("business_domains"),
                 ),
             }
+
             self.add_node(node)
             self.entity_by_id[entity_key] = entity_node_id
+
             module_id = entity.get("module_id")
 
-            for table_name in entity.get("tables", []):
-                table_id = self.table_by_name.get(str(table_name).upper())
+            for table_name in entity.get(
+                    "tables",
+                    [],
+            ):
+                table_id = self.table_by_name.get(
+                    str(table_name).upper()
+                )
+
                 if table_id:
-                    self.add_edge(entity_node_id, table_id, "mapped_to_entity")
-            for subject_area_name in entity.get("subject_areas", []):
+                    self.add_edge(
+                        entity_node_id,
+                        table_id,
+                        "mapped_to_entity",
+                    )
+
+            for subject_area_name in entity.get(
+                    "subject_areas",
+                    [],
+            ):
                 for subject_id in self._matching_ids(
-                    self.subject_area_by_name,
-                    subject_area_name,
-                    module_id,
+                        self.subject_area_by_name,
+                        subject_area_name,
+                        module_id,
                 ):
-                    self.add_edge(entity_node_id, subject_id, "mapped_to_entity")
-            for resource_name in entity.get("rest_resources", []):
+                    self.add_edge(
+                        entity_node_id,
+                        subject_id,
+                        "mapped_to_entity",
+                    )
+
+            for resource_name in entity.get(
+                    "rest_resources",
+                    [],
+            ):
                 for resource_id in self._matching_ids(
-                    self.rest_resource_by_name,
-                    resource_name,
-                    module_id,
+                        self.rest_resource_by_name,
+                        resource_name,
+                        module_id,
                 ):
-                    self.add_edge(entity_node_id, resource_id, "mapped_to_entity")
-            for rule_id in entity.get("validated_rules", []):
+                    self.add_edge(
+                        entity_node_id,
+                        resource_id,
+                        "mapped_to_entity",
+                    )
+
+            for rule_id in entity.get(
+                    "validated_rules",
+                    [],
+            ):
                 if rule_id in self.nodes:
-                    self.add_edge(entity_node_id, rule_id, "mapped_to_entity")
+                    self.add_edge(
+                        entity_node_id,
+                        rule_id,
+                        "mapped_to_entity",
+                    )
+
+            for attribute in entity.get(
+                    "attributes",
+                    [],
+            ):
+                attribute_key = attribute.get(
+                    "attribute_id"
+                )
+
+                if not attribute_key:
+                    continue
+
+                attribute_node_id = stable_id(
+                    "attribute",
+                    f"{entity_key}.{attribute_key}",
+                )
+
+                attribute_node = {
+                    "id": attribute_node_id,
+                    "node_type": "business_attribute",
+                    "attribute_id": attribute_key,
+                    "entity_id": entity_key,
+                    "name": attribute.get(
+                        "name",
+                        attribute_key,
+                    ),
+                    "title": attribute.get(
+                        "name",
+                        attribute_key,
+                    ),
+                    "aliases": attribute.get(
+                        "aliases",
+                        [],
+                    ),
+                    "description": attribute.get(
+                        "description"
+                    ),
+                    "columns": attribute.get(
+                        "columns",
+                        [],
+                    ),
+                    "module_id": module_id,
+                    "confidence": attribute.get(
+                        "confidence",
+                        "high",
+                    ),
+                    "source": {
+                        "source_type": "curated_entity_map",
+                        "entity_aliases_path": str(path),
+                        "module_id": module_id,
+                    },
+                    "search_text": merge_text_fields(
+                        attribute_key,
+                        attribute.get("name"),
+                        attribute.get("aliases"),
+                        attribute.get("description"),
+                        attribute.get("columns"),
+                        entity_key,
+                        entity.get("name"),
+                        entity.get("aliases"),
+                    ),
+                }
+
+                self.add_node(attribute_node)
+
+                self.add_edge(
+                    entity_node_id,
+                    attribute_node_id,
+                    "has_attribute",
+                    weight=1.0,
+                    evidence={
+                        "entity_id": entity_key,
+                        "attribute_id": attribute_key,
+                    },
+                )
+
+                for qualified_name in attribute.get(
+                        "columns",
+                        [],
+                ):
+                    normalized_qualified_name = str(
+                        qualified_name
+                    ).upper()
+
+                    column_id = (
+                        self.column_by_qualified_name.get(
+                            normalized_qualified_name
+                        )
+                    )
+
+                    if not column_id:
+                        continue
+
+                    self.add_edge(
+                        attribute_node_id,
+                        column_id,
+                        "mapped_to_attribute",
+                        weight=1.0,
+                        evidence={
+                            "entity_id": entity_key,
+                            "attribute_id": attribute_key,
+                            "qualified_name": (
+                                normalized_qualified_name
+                            ),
+                        },
+                    )
 
         self._link_entities_by_alias()
 

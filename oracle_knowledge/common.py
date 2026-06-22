@@ -51,8 +51,55 @@ def normalize_text(value: str | None) -> str:
 
 
 def tokenize(value: str | None) -> list[str]:
-    tokens = [token.lower() for token in WORD_RE.findall(strip_accents(value or ""))]
-    return [token for token in tokens if len(token) > 1 and token not in STOPWORDS]
+    text = strip_accents(value or "")
+    tokens: list[str] = []
+
+    for raw_token in WORD_RE.findall(text):
+        normalized_token = raw_token.lower()
+        candidates = [normalized_token]
+
+        camel_case_value = re.sub(
+            r"(?<=[a-z0-9])(?=[A-Z])",
+            " ",
+            raw_token,
+        )
+        camel_case_value = re.sub(
+            r"(?<=[A-Z])(?=[A-Z][a-z])",
+            " ",
+            camel_case_value,
+        )
+        camel_case_value = re.sub(
+            r"(?<=[A-Za-z])(?=[0-9])|(?<=[0-9])(?=[A-Za-z])",
+            " ",
+            camel_case_value,
+        )
+
+        camel_case_parts = [
+            part.lower()
+            for part in camel_case_value.split()
+            if part
+        ]
+
+        if len(camel_case_parts) > 1:
+            candidates.extend(camel_case_parts)
+
+        if "_" in normalized_token:
+            candidates.extend(
+                part
+                for part in normalized_token.split("_")
+                if part
+            )
+
+        for candidate in candidates:
+            if len(candidate) <= 1:
+                continue
+
+            if candidate in STOPWORDS:
+                continue
+
+            tokens.append(candidate)
+
+    return tokens
 
 
 def slugify(value: str) -> str:
