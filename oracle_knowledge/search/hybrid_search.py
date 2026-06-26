@@ -671,34 +671,246 @@ class HybridSearch:
         }
 
     @staticmethod
-    def _evidence_payload(node: dict[str, Any]) -> dict[str, Any]:
-        allowed = [
+    @staticmethod
+    def _evidence_payload(
+            node: dict[str, Any],
+    ) -> dict[str, Any]:
+        def compact_text(
+                value: Any,
+                max_characters: int = 700,
+        ) -> str:
+            text = str(value).strip()
+
+            if len(text) <= max_characters:
+                return text
+
+            return (
+                    text[: max_characters - 3].rstrip()
+                    + "..."
+            )
+
+        def compact_value(
+                value: Any,
+                *,
+                max_items: int = 8,
+                max_characters: int = 700,
+                depth: int = 0,
+        ) -> Any:
+            if value in (None, "", [], {}):
+                return None
+
+            if isinstance(value, str):
+                return compact_text(
+                    value,
+                    max_characters=max_characters,
+                )
+
+            if isinstance(value, dict):
+                compacted: dict[str, Any] = {}
+
+                for key, item in value.items():
+                    if key in {
+                        "search_text",
+                        "keywords",
+                        "source",
+                        "sources",
+                        "graph_paths",
+                        "score_breakdown",
+                        "node",
+                    }:
+                        continue
+
+                    compacted_item = compact_value(
+                        item,
+                        max_items=max_items,
+                        max_characters=max_characters,
+                        depth=depth + 1,
+                    )
+
+                    if compacted_item not in (
+                            None,
+                            "",
+                            [],
+                            {},
+                    ):
+                        compacted[key] = compacted_item
+
+                return compacted or None
+
+            if isinstance(value, (list, tuple, set)):
+                compacted_items: list[Any] = []
+
+                for item in list(value)[:max_items]:
+                    compacted_item = compact_value(
+                        item,
+                        max_items=max_items,
+                        max_characters=max_characters,
+                        depth=depth + 1,
+                    )
+
+                    if compacted_item not in (
+                            None,
+                            "",
+                            [],
+                            {},
+                    ):
+                        compacted_items.append(
+                            compacted_item
+                        )
+
+                return compacted_items or None
+
+            return value
+
+        node_type = node.get("node_type")
+
+        fields_by_node_type: dict[
+            str,
+            list[str],
+        ] = {
+            "business_entity": [
+                "entity_id",
+                "aliases",
+                "business_domains",
+                "tables",
+                "subject_areas",
+                "rest_resources",
+                "validated_rules",
+            ],
+            "business_attribute": [
+                "attribute_id",
+                "entity_id",
+                "aliases",
+                "columns",
+                "confidence",
+            ],
+            "physical_table": [
+                "primary_key",
+                "result_grain",
+                "ranking_rules",
+                "business_rules",
+            ],
+            "physical_column": [
+                "qualified_name",
+                "table_name",
+                "datatype",
+                "nullable",
+                "semantics",
+            ],
+            "validated_rule": [
+                "conditions",
+                "ranking",
+                "tables",
+                "columns",
+                "sql_template",
+            ],
+            "functional_section": [
+                "tables",
+                "columns",
+                "attributes",
+                "business_rules",
+            ],
+            "otbi_subject_area": [
+                "subject_areas",
+                "transactional_grain",
+                "time_reporting",
+                "tables",
+                "columns",
+            ],
+            "otbi_business_question": [
+                "subject_areas",
+                "transactional_grain",
+                "time_reporting",
+                "tables",
+                "columns",
+            ],
+            "rest_resource": [
+                "endpoint_path",
+                "method",
+                "resource_hierarchy",
+                "parameters",
+                "attributes",
+            ],
+            "rest_operation": [
+                "endpoint_path",
+                "method",
+                "resource_hierarchy",
+                "parameters",
+                "attributes",
+            ],
+        }
+
+        default_fields = [
             "entity_id",
             "aliases",
             "primary_key",
             "result_grain",
-            "ranking_rules",
-            "business_rules",
             "conditions",
             "ranking",
             "tables",
             "columns",
-            "sql_template",
-            "transactional_grain",
-            "time_reporting",
-            "subject_areas",
+            "qualified_name",
             "endpoint_path",
             "method",
             "resource_hierarchy",
-            "parameters",
-            "attributes",
-            "semantics",
-            "qualified_name",
-            "module_id",
-            "module_name",
-            "modules",
         ]
-        return {key: node[key] for key in allowed if node.get(key) not in (None, [], {}, "")}
+
+        selected_fields = fields_by_node_type.get(
+            str(node_type),
+            default_fields,
+        )
+
+        item_limits = {
+            "aliases": 12,
+            "business_domains": 8,
+            "tables": 12,
+            "columns": 20,
+            "subject_areas": 8,
+            "rest_resources": 8,
+            "validated_rules": 8,
+            "ranking_rules": 3,
+            "business_rules": 6,
+            "attributes": 12,
+            "semantics": 4,
+            "parameters": 12,
+            "resource_hierarchy": 8,
+        }
+
+        character_limits = {
+            "sql_template": 1800,
+            "business_rules": 600,
+            "ranking_rules": 600,
+            "semantics": 500,
+            "attributes": 500,
+            "parameters": 500,
+        }
+
+        payload: dict[str, Any] = {}
+
+        for field in selected_fields:
+            value = node.get(field)
+
+            compacted_value = compact_value(
+                value,
+                max_items=item_limits.get(
+                    field,
+                    8,
+                ),
+                max_characters=character_limits.get(
+                    field,
+                    700,
+                ),
+            )
+
+            if compacted_value not in (
+                    None,
+                    "",
+                    [],
+                    {},
+            ):
+                payload[field] = compacted_value
+
+        return payload
 
 
 def build_parser() -> argparse.ArgumentParser:
