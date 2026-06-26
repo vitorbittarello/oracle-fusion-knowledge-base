@@ -14,6 +14,9 @@ from oracle_knowledge.common import (
     read_json,
     tokenize,
 )
+from oracle_knowledge.search.semantic_context import (
+    SemanticTextSelector,
+)
 
 SOURCE_BOOSTS = {
     "validated_environment_rule": 1.35,
@@ -51,9 +54,19 @@ class SearchConfig:
 
 
 class HybridSearch:
-    def __init__(self, graph: dict[str, Any], config: SearchConfig | None = None):
+    def __init__(
+            self,
+            graph: dict[str, Any],
+            config: SearchConfig | None = None,
+            *,
+            semantic_text_selector: SemanticTextSelector | None = None,
+    ):
         self.graph = graph
         self.config = config or SearchConfig()
+        self.semantic_text_selector = (
+            semantic_text_selector
+            or SemanticTextSelector()
+        )
         self.nodes = {node["id"]: node for node in graph.get("nodes", [])}
         self.documents: dict[str, list[str]] = {}
         self.term_frequencies: dict[str, Counter[str]] = {}
@@ -63,8 +76,18 @@ class HybridSearch:
         self._build_index()
 
     @classmethod
-    def from_file(cls, path: str, config: SearchConfig | None = None) -> "HybridSearch":
-        return cls(read_json(path, {}), config=config)
+    def from_file(
+            cls,
+            path: str,
+            config: SearchConfig | None = None,
+            *,
+            semantic_text_selector: SemanticTextSelector | None = None,
+    ) -> "HybridSearch":
+        return cls(
+            read_json(path, {}),
+            config=config,
+            semantic_text_selector=semantic_text_selector,
+        )
 
     def _build_index(self) -> None:
         for node_id, node in self.nodes.items():
@@ -571,86 +594,891 @@ class HybridSearch:
         return expansion
 
     @staticmethod
-    def _summary(node: dict[str, Any], max_length: int = 500) -> str:
-        text = merge_text_fields(
-            node.get("description"),
-            node.get("text"),
-            node.get("question"),
-            node.get("transactional_grain"),
-            node.get("business_rules"),
-            node.get("conditions"),
+    def _context_summary_source(
+            node: dict[str, Any],
+    ) -> str:
+        """
+        Retorna somente conteúdo textual próprio do nó.
+
+        Estruturas como business_rules, conditions, listas e dicionários
+        permanecem na evidência estruturada e nunca são convertidas para
+        texto de resumo. Isso evita que representações Python sejam
+        enviadas ao SemanticTextSelector ou apareçam no prompt final.
+        """
+        textual_fields = (
+            "description",
+            "text",
+            "question",
+            "transactional_grain",
+            "time_reporting",
+            "purpose",
+            "usage",
+            "details",
+            "content",
         )
+
+        values: list[str] = []
+        seen: set[str] = set()
+
+        for field_name in textual_fields:
+            value = node.get(field_name)
+
+            if not isinstance(value, str):
+                continue
+
+            normalized_value = " ".join(value.split())
+
+            if (
+                    not normalized_value
+                    or normalized_value in seen
+            ):
+                continue
+
+            seen.add(normalized_value)
+            values.append(normalized_value)
+
+        return merge_text_fields(*values)
+
+    @staticmethod
+    def _summary(node: dict[str, Any], max_length: int = 500) -> str:
+        text = HybridSearch._context_summary_source(node)
         if len(text) <= max_length:
             return text
         return text[: max_length - 1].rstrip() + "…"
 
-    def build_prompt_context(
-        self,
-        query: str,
-        *,
-        limit: int = 16,
-        max_characters: int = 14000,
-        module_ids: set[str] | None = None,
+    @staticmethod
+    def _context_evidence_group(
+            block: dict[str, Any],
+    ) -> str:
+        node_type = str(
+            block.get("node_type") or ""
+        )
+
+        source_type = str(
+            block.get(
+                "source",
+                {},
+            ).get(
+                "source_type"
+            )
+            or ""
+        )
+
+        if (
+                node_type == "validated_rule"
+                or source_type
+                == "validated_environment_rule"
+        ):
+            return "validated_rules"
+
+        if node_type == "physical_column":
+            return "physical_columns"
+
+        if node_type == "physical_table":
+            return "physical_tables"
+
+        if node_type in {
+            "business_entity",
+            "business_attribute",
+        }:
+            return "business_context"
+
+        if (
+                node_type.startswith("otbi_")
+                or source_type
+                == "oracle_otbi_documentation"
+        ):
+            return "otbi"
+
+        if (
+                node_type.startswith("rest_")
+                or source_type
+                == "oracle_rest_documentation"
+        ):
+            return "rest"
+
+        if (
+                node_type == "functional_section"
+                or source_type
+                == "oracle_functional_documentation"
+        ):
+            return "functional_documentation"
+
+        return "exploratory"
+
+    @staticmethod
+    def _public_context_block(
+            block: dict[str, Any],
     ) -> dict[str, Any]:
-        results = self.search(query, limit=limit, module_ids=module_ids)
-        groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        used = 0
-        selected: list[dict[str, Any]] = []
+        """
+        Remove metadados internos usados apenas durante a montagem do
+        contexto.
+
+        Chaves iniciadas por ``_`` nunca são expostas no JSON final nem
+        consideradas como evidência para a LLM.
+        """
+        return {
+            key: value
+            for key, value in block.items()
+            if not str(key).startswith("_")
+        }
+
+    @staticmethod
+    def _distribute_character_budget(
+            items: list[dict[str, Any]],
+            available: int,
+            *,
+            capacity_key: str,
+            allocation_key: str,
+    ) -> int:
+        """
+        Distribui caracteres proporcionalmente ao score dos itens.
+
+        A distribuição respeita a capacidade individual informada e
+        devolve a quantidade que não pôde ser utilizada. O método não
+        altera ranking, score ou conteúdo; apenas incrementa a alocação
+        numérica usada posteriormente pelo seletor semântico.
+        """
+        remaining = max(0, int(available))
+        active = [
+            item
+            for item in items
+            if int(item.get(capacity_key, 0)) > 0
+        ]
+
+        while remaining > 0 and active:
+            active = [
+                item
+                for item in active
+                if int(item.get(capacity_key, 0)) > 0
+            ]
+
+            if not active:
+                break
+
+            total_weight = sum(
+                max(float(item.get("score") or 0.0), 0.000001)
+                for item in active
+            )
+            round_budget = remaining
+            increments: list[tuple[dict[str, Any], int]] = []
+            allocated_in_round = 0
+
+            for item in active:
+                capacity = int(item.get(capacity_key, 0))
+                weight = max(
+                    float(item.get("score") or 0.0),
+                    0.000001,
+                )
+                share = int(
+                    round_budget * weight / total_weight
+                )
+                increment = min(share, capacity)
+
+                if increment <= 0:
+                    continue
+
+                increments.append((item, increment))
+                allocated_in_round += increment
+
+            if allocated_in_round <= 0:
+                item = max(
+                    active,
+                    key=lambda candidate: (
+                        float(candidate.get("score") or 0.0),
+                        int(candidate.get(capacity_key, 0)),
+                    ),
+                )
+                increments = [(item, 1)]
+                allocated_in_round = 1
+
+            for item, increment in increments:
+                item[allocation_key] = int(
+                    item.get(allocation_key, 0)
+                ) + increment
+                item[capacity_key] = int(
+                    item.get(capacity_key, 0)
+                ) - increment
+
+            remaining -= allocated_in_round
+
+        return remaining
+
+    @classmethod
+    def _diversify_selection(
+            cls,
+            blocks: list[dict[str, Any]],
+            *,
+            max_items: int,
+            max_characters: int,
+            equal_budget_fraction: float = 0.40,
+            min_relative_score_ratio: float = 0.05,
+            min_group_score_ratio: float = 0.10,
+            minimum_summary_characters: int = 96,
+            maximum_summary_characters: int = 500,
+    ) -> list[dict[str, Any]]:
+        """
+        Distribui o orçamento do contexto entre categorias relevantes.
+
+        O orçamento é calculado em três partes:
+
+        1. custo estrutural mínimo do melhor item de cada grupo;
+        2. parcela igualitária entre os grupos representados;
+        3. parcela proporcional ao maior score de cada grupo.
+
+        Depois da representação mínima, candidatos adicionais competem
+        dentro do orçamento do próprio grupo pela ordem global do
+        ranking. Sobras são redistribuídas globalmente pelo mesmo
+        ranking. O texto ainda não é resumido aqui; cada item recebe um
+        orçamento dinâmico que será consumido por SemanticTextSelector
+        em build_prompt_context().
+
+        O método preserva a ordem relativa original dos resultados e
+        nunca força categorias cujo melhor score esteja muito distante
+        do melhor grupo recuperado.
+        """
+        if (
+                not blocks
+                or max_items <= 0
+                or max_characters <= 0
+        ):
+            return []
+
+        group_priority = (
+            "validated_rules",
+            "physical_columns",
+            "physical_tables",
+            "business_context",
+            "otbi",
+            "rest",
+            "functional_documentation",
+        )
+        priority_index = {
+            group: index
+            for index, group in enumerate(group_priority)
+        }
+
+        equal_budget_fraction = min(
+            max(float(equal_budget_fraction), 0.0),
+            1.0,
+        )
+        minimum_summary_characters = max(
+            0,
+            int(minimum_summary_characters),
+        )
+        maximum_summary_characters = max(
+            0,
+            int(maximum_summary_characters),
+        )
+
+        prepared: list[dict[str, Any]] = []
+
+        for rank_index, block in enumerate(blocks):
+            public_block = cls._public_context_block(block)
+            public_block["summary"] = ""
+            summary_source = " ".join(
+                str(
+                    block.get("_summary_source")
+                    or block.get("summary")
+                    or ""
+                ).split()
+            )
+            fixed_size = len(
+                json.dumps(
+                    public_block,
+                    ensure_ascii=False,
+                )
+            )
+            summary_cap = min(
+                len(summary_source),
+                maximum_summary_characters,
+            )
+
+            prepared.append(
+                {
+                    "rank_index": rank_index,
+                    "block": block,
+                    "group": cls._context_evidence_group(block),
+                    "score": float(block.get("score") or 0.0),
+                    "fixed_size": fixed_size,
+                    "summary_cap": summary_cap,
+                    "summary_allocation": 0,
+                    "summary_capacity": summary_cap,
+                }
+            )
+
+        top_score = max(
+            (item["score"] for item in prepared),
+            default=0.0,
+        )
+        relevance_floor = top_score * max(
+            0.0,
+            float(min_relative_score_ratio),
+        )
+        relevant = [
+            item
+            for item in prepared
+            if item["score"] >= relevance_floor
+        ]
+
+        if not relevant:
+            return []
+
+        candidates_by_group: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for item in relevant:
+            candidates_by_group[item["group"]].append(item)
+
+        group_best_score = {
+            group: max(item["score"] for item in items)
+            for group, items in candidates_by_group.items()
+            if group != "exploratory"
+        }
+        best_group_score = max(
+            group_best_score.values(),
+            default=0.0,
+        )
+        group_floor = best_group_score * max(
+            0.0,
+            float(min_group_score_ratio),
+        )
+
+        eligible_groups = [
+            group
+            for group, score in group_best_score.items()
+            if (
+                score >= group_floor
+                or group == "validated_rules"
+            )
+        ]
+        eligible_groups.sort(
+            key=lambda group: (
+                -group_best_score[group],
+                priority_index.get(group, len(group_priority)),
+            )
+        )
+        eligible_groups = eligible_groups[:max_items]
+
+        selected_groups: list[str] = []
+        minimum_group_cost: dict[str, int] = {}
+        minimum_used = 0
+
+        for group in eligible_groups:
+            top_item = candidates_by_group[group][0]
+            fixed_size = int(top_item["fixed_size"])
+
+            if minimum_used + fixed_size > max_characters:
+                continue
+
+            selected_groups.append(group)
+            minimum_group_cost[group] = fixed_size
+            minimum_used += fixed_size
+
+        if not selected_groups:
+            fallback = relevant[0]
+            if fallback["fixed_size"] > max_characters:
+                return []
+            selected_groups = [fallback["group"]]
+            minimum_group_cost[fallback["group"]] = fallback["fixed_size"]
+            minimum_used = fallback["fixed_size"]
+
+        remaining_for_groups = max_characters - minimum_used
+        equal_pool = int(
+            remaining_for_groups * equal_budget_fraction
+        )
+        proportional_pool = remaining_for_groups - equal_pool
+        group_budgets = dict(minimum_group_cost)
+
+        equal_share, equal_remainder = divmod(
+            equal_pool,
+            len(selected_groups),
+        )
+        for index, group in enumerate(selected_groups):
+            group_budgets[group] += equal_share
+            if index < equal_remainder:
+                group_budgets[group] += 1
+
+        score_sum = sum(
+            max(group_best_score.get(group, 0.0), 0.000001)
+            for group in selected_groups
+        )
+        proportional_allocated = 0
+
+        for group in selected_groups:
+            weight = max(
+                group_best_score.get(group, 0.0),
+                0.000001,
+            )
+            share = int(
+                proportional_pool * weight / score_sum
+            )
+            group_budgets[group] += share
+            proportional_allocated += share
+
+        unallocated = proportional_pool - proportional_allocated
+        for group in selected_groups:
+            if unallocated <= 0:
+                break
+            group_budgets[group] += 1
+            unallocated -= 1
+
+        selected_items: list[dict[str, Any]] = []
+        selected_ranks: set[int] = set()
+        group_used: Counter[str] = Counter()
+
+        def add_item(
+                item: dict[str, Any],
+                *,
+                summary_characters: int,
+        ) -> bool:
+            if (
+                    len(selected_items) >= max_items
+                    or item["rank_index"] in selected_ranks
+            ):
+                return False
+
+            summary_characters = min(
+                max(0, int(summary_characters)),
+                int(item["summary_cap"]),
+            )
+            item["summary_allocation"] = summary_characters
+            item["summary_capacity"] = (
+                int(item["summary_cap"])
+                - summary_characters
+            )
+            selected_items.append(item)
+            selected_ranks.add(item["rank_index"])
+            group_used[item["group"]] += (
+                int(item["fixed_size"])
+                + summary_characters
+            )
+            return True
+
+        # Um representante estrutural por grupo relevante.
+        for group in selected_groups:
+            item = candidates_by_group[group][0]
+            available = max(
+                0,
+                group_budgets[group] - int(item["fixed_size"]),
+            )
+            initial_summary = min(
+                int(item["summary_cap"]),
+                minimum_summary_characters,
+                available,
+            )
+            add_item(
+                item,
+                summary_characters=initial_summary,
+            )
+
+        # Candidatos adicionais disputam apenas o orçamento do seu grupo
+        # e seguem exatamente a ordem global do ranking.
+        for item in relevant:
+            if len(selected_items) >= max_items:
+                break
+
+            group = item["group"]
+            if (
+                    group not in group_budgets
+                    or item["rank_index"] in selected_ranks
+            ):
+                continue
+
+            minimum_summary = min(
+                int(item["summary_cap"]),
+                minimum_summary_characters,
+            )
+            required = int(item["fixed_size"]) + minimum_summary
+            available = group_budgets[group] - group_used[group]
+
+            if required > available:
+                continue
+
+            add_item(
+                item,
+                summary_characters=minimum_summary,
+            )
+
+        # Usa o saldo de cada categoria para enriquecer semanticamente
+        # os itens já selecionados daquele grupo.
+        for group in selected_groups:
+            group_items = [
+                item
+                for item in selected_items
+                if item["group"] == group
+            ]
+            available = max(
+                0,
+                group_budgets[group] - group_used[group],
+            )
+            unused = cls._distribute_character_budget(
+                group_items,
+                available,
+                capacity_key="summary_capacity",
+                allocation_key="summary_allocation",
+            )
+            group_used[group] += available - unused
+
+        used = sum(
+            int(item["fixed_size"])
+            + int(item["summary_allocation"])
+            for item in selected_items
+        )
+        remaining_global = max(0, max_characters - used)
+
+        # Redistribuição global por ranking: primeiro enriquece ou inclui
+        # as evidências mais bem pontuadas; somente depois alcança itens
+        # exploratórios ou de menor score.
+        for item in relevant:
+            if remaining_global <= 0:
+                break
+
+            if item["rank_index"] in selected_ranks:
+                capacity = int(item["summary_capacity"])
+                increment = min(capacity, remaining_global)
+                item["summary_allocation"] += increment
+                item["summary_capacity"] -= increment
+                remaining_global -= increment
+                continue
+
+            if len(selected_items) >= max_items:
+                continue
+
+            minimum_summary = min(
+                int(item["summary_cap"]),
+                minimum_summary_characters,
+            )
+            required = int(item["fixed_size"]) + minimum_summary
+
+            if required > remaining_global:
+                continue
+
+            add_item(
+                item,
+                summary_characters=minimum_summary,
+            )
+            remaining_global -= required
+
+        if remaining_global > 0:
+            remaining_global = cls._distribute_character_budget(
+                selected_items,
+                remaining_global,
+                capacity_key="summary_capacity",
+                allocation_key="summary_allocation",
+            )
+
+        selected_items.sort(
+            key=lambda item: item["rank_index"]
+        )
+
+        selected_blocks: list[dict[str, Any]] = []
+        for item in selected_items:
+            block = dict(item["block"])
+            block["_allocated_characters"] = (
+                int(item["fixed_size"])
+                + int(item["summary_allocation"])
+            )
+            block["_summary_max_characters"] = int(
+                item["summary_allocation"]
+            )
+            selected_blocks.append(block)
+
+        return selected_blocks
+
+    @staticmethod
+    def _physical_table_context_evidence(
+            node: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Gera uma evidência compacta para tabelas físicas.
+
+        O contexto completo das tabelas pode conter dezenas de regras
+        técnicas, flags, auditoria e bloqueio otimista. Esse volume
+        tende a consumir uma parcela desproporcional do orçamento do
+        prompt.
+
+        Para geração de SQL, são preservados os elementos com maior
+        valor estrutural:
+
+        - chave primária;
+        - grão documentado;
+        - relacionamentos referenciais úteis para joins.
+
+        A descrição funcional da tabela já permanece disponível no
+        campo summary do bloco. Portanto, o documented_business_context
+        não é repetido dentro da evidência estruturada.
+
+        As regras completas continuam armazenadas no grafo e não são
+        alteradas ou removidas da base.
+        """
+        relationships: list[dict[str, Any]] = []
+
+        for rule in node.get(
+                "business_rules",
+                [],
+        ):
+            if (
+                    rule.get("rule_type")
+                    != "referential_integrity"
+            ):
+                continue
+
+            relationship = {
+                "columns": rule.get(
+                    "columns",
+                    [],
+                ),
+                "referenced_table": rule.get(
+                    "referenced_table"
+                ),
+                "referenced_column": rule.get(
+                    "referenced_column"
+                ),
+                "confidence": rule.get(
+                    "confidence"
+                ),
+            }
+
+            compact_relationship = {
+                key: value
+                for key, value
+                in relationship.items()
+                if value not in (
+                    None,
+                    "",
+                    [],
+                    {},
+                )
+            }
+
+            if compact_relationship:
+                relationships.append(
+                    compact_relationship
+                )
+
+            if len(relationships) >= 6:
+                break
+
+        payload = {
+            "primary_key": node.get(
+                "primary_key"
+            ),
+            "result_grain": node.get(
+                "result_grain"
+            ),
+            "relationships": relationships,
+        }
+
+        return {
+            key: value
+            for key, value
+            in payload.items()
+            if value not in (
+                None,
+                "",
+                [],
+                {},
+            )
+        }
+
+    def build_prompt_context(
+            self,
+            query: str,
+            *,
+            limit: int = 16,
+            max_characters: int = 14000,
+            module_ids: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Monta o contexto da LLM a partir dos resultados já ranqueados.
+
+        A busca recupera mais candidatos do que o limite final. Em
+        seguida, o orçamento é distribuído entre as categorias
+        relevantes e cada item recebe um limite textual próprio.
+        SemanticTextSelector só é executado depois dessa distribuição,
+        usando o espaço efetivamente disponível para o item.
+
+        Busca, score, expansão do grafo e ranking permanecem
+        inalterados. O parâmetro limit continua representando a
+        quantidade máxima de evidências no contexto final.
+        """
+        candidate_limit = max(
+            limit,
+            limit * 3,
+            limit + 12,
+        )
+
+        results = self.search(
+            query,
+            limit=candidate_limit,
+            module_ids=module_ids,
+        )
+
+        blocks: list[dict[str, Any]] = []
+
         for result in results:
             node = result["node"]
-            source_type = node.get("source", {}).get("source_type", "unknown")
-            block = {
-                "id": result["id"],
-                "node_type": result["node_type"],
-                "title": result["title"],
-                "score": result["score"],
-                "summary": result["summary"],
-                "source": result["source"],
-                "sources": result.get("sources", []),
-                "modules": result.get("modules", []),
-                "evidence": self._evidence_payload(node),
-            }
-            estimated = len(json.dumps(block, ensure_ascii=False))
-            if selected and used + estimated > max_characters:
-                break
-            used += estimated
-            selected.append(block)
-            groups[source_type].append(block)
+            summary_source = (
+                self._context_summary_source(node)
+                or result["summary"]
+            )
 
-        priority = [
-            "validated_environment_rule",
-            "oracle_functional_documentation",
-            "oracle_otbi_documentation",
-            "oracle_rest_documentation",
-            "oracle_data_dictionary",
-            "curated_entity_map",
-            "unknown",
-        ]
+            if result["node_type"] == "physical_table":
+                evidence = self._physical_table_context_evidence(node)
+            else:
+                evidence = self._evidence_payload(node)
+
+            blocks.append(
+                {
+                    "id": result["id"],
+                    "node_type": result["node_type"],
+                    "title": result["title"],
+                    "score": result["score"],
+                    "summary": "",
+                    "source": result["source"],
+                    "sources": result.get("sources", []),
+                    "modules": result.get("modules", []),
+                    "evidence": evidence,
+                    "_summary_source": summary_source,
+                }
+            )
+
+        selected_with_budget = self._diversify_selection(
+            blocks,
+            max_items=limit,
+            max_characters=max_characters,
+            maximum_summary_characters=(
+                self.semantic_text_selector.config
+                .summary_max_characters
+            ),
+        )
+
+        selected: list[dict[str, Any]] = []
+
+        for budgeted_block in selected_with_budget:
+            summary_source = str(
+                budgeted_block.get("_summary_source")
+                or ""
+            )
+            allocated_characters = int(
+                budgeted_block.get("_allocated_characters")
+                or 0
+            )
+            allocated_summary = int(
+                budgeted_block.get("_summary_max_characters")
+                or 0
+            )
+
+            public_block = self._public_context_block(
+                budgeted_block
+            )
+            public_block["summary"] = ""
+            fixed_size = len(
+                json.dumps(
+                    public_block,
+                    ensure_ascii=False,
+                )
+            )
+            available_summary = min(
+                allocated_summary,
+                max(0, allocated_characters - fixed_size),
+            )
+
+            semantic_summary = (
+                self.semantic_text_selector.select_relevant_text(
+                    query,
+                    summary_source,
+                    max_characters=available_summary,
+                )
+            )
+
+            while semantic_summary:
+                encoded_size = len(
+                    json.dumps(
+                        semantic_summary,
+                        ensure_ascii=False,
+                    )
+                ) - 2
+
+                if encoded_size <= available_summary:
+                    break
+
+                overflow = encoded_size - available_summary
+                new_length = max(
+                    0,
+                    len(semantic_summary) - max(1, overflow),
+                )
+                semantic_summary = semantic_summary[:new_length].rstrip()
+
+            public_block["summary"] = semantic_summary
+            selected.append(public_block)
+
+        used = sum(
+            len(
+                json.dumps(
+                    block,
+                    ensure_ascii=False,
+                )
+            )
+            for block in selected
+        )
+
         context_lines = [
             "OBJETIVO",
             query,
             "",
             "EVIDÊNCIAS RECUPERADAS",
         ]
-        for source_type in priority:
-            rows = groups.get(source_type, [])
-            if not rows:
-                continue
-            context_lines.append(f"\n[{source_type}]")
-            for index, row in enumerate(rows, start=1):
+
+        # A apresentação segue a ordem original do ranking.
+        # A categoria é informada em cada linha, sem reagrupar ou
+        # reposicionar os resultados por tipo ou fonte.
+        for index, row in enumerate(
+                selected,
+                start=1,
+        ):
+            evidence_group = self._context_evidence_group(row)
+            source_type = row.get(
+                "source",
+                {},
+            ).get(
+                "source_type",
+                "unknown",
+            )
+
+            context_lines.append(
+                "\n"
+                f"{index}. {row['title']} "
+                f"| grupo={evidence_group} "
+                f"| fonte={source_type} "
+                f"| tipo={row['node_type']} "
+                f"| módulos="
+                f"{','.join(row.get('modules', [])) or 'n/a'} "
+                f"| score={row['score']}"
+            )
+
+            if row["summary"]:
                 context_lines.append(
-                    f"{index}. {row['title']} | tipo={row['node_type']} | módulos={','.join(row.get('modules', [])) or 'n/a'} | score={row['score']}"
+                    f"   {row['summary']}"
                 )
-                if row["summary"]:
-                    context_lines.append(f"   {row['summary']}")
-                if row["evidence"]:
-                    context_lines.append(
-                        "   Evidência estruturada: "
-                        + json.dumps(row["evidence"], ensure_ascii=False)
+
+            if row["evidence"]:
+                context_lines.append(
+                    "   Evidência estruturada: "
+                    + json.dumps(
+                        row["evidence"],
+                        ensure_ascii=False,
                     )
-                url = row.get("source", {}).get("url")
-                if url:
-                    context_lines.append(f"   Fonte: {url}")
+                )
+
+            url = row.get(
+                "source",
+                {},
+            ).get("url")
+
+            if url:
+                context_lines.append(
+                    f"   Fonte: {url}"
+                )
 
         context_lines.extend(
             [
@@ -663,6 +1491,7 @@ class HybridSearch:
                 "- OBJECT_VERSION_NUMBER é controle otimista, salvo evidência funcional em contrário.",
             ]
         )
+
         return {
             "query": query,
             "context": "\n".join(context_lines),
@@ -671,246 +1500,34 @@ class HybridSearch:
         }
 
     @staticmethod
-    @staticmethod
-    def _evidence_payload(
-            node: dict[str, Any],
-    ) -> dict[str, Any]:
-        def compact_text(
-                value: Any,
-                max_characters: int = 700,
-        ) -> str:
-            text = str(value).strip()
-
-            if len(text) <= max_characters:
-                return text
-
-            return (
-                    text[: max_characters - 3].rstrip()
-                    + "..."
-            )
-
-        def compact_value(
-                value: Any,
-                *,
-                max_items: int = 8,
-                max_characters: int = 700,
-                depth: int = 0,
-        ) -> Any:
-            if value in (None, "", [], {}):
-                return None
-
-            if isinstance(value, str):
-                return compact_text(
-                    value,
-                    max_characters=max_characters,
-                )
-
-            if isinstance(value, dict):
-                compacted: dict[str, Any] = {}
-
-                for key, item in value.items():
-                    if key in {
-                        "search_text",
-                        "keywords",
-                        "source",
-                        "sources",
-                        "graph_paths",
-                        "score_breakdown",
-                        "node",
-                    }:
-                        continue
-
-                    compacted_item = compact_value(
-                        item,
-                        max_items=max_items,
-                        max_characters=max_characters,
-                        depth=depth + 1,
-                    )
-
-                    if compacted_item not in (
-                            None,
-                            "",
-                            [],
-                            {},
-                    ):
-                        compacted[key] = compacted_item
-
-                return compacted or None
-
-            if isinstance(value, (list, tuple, set)):
-                compacted_items: list[Any] = []
-
-                for item in list(value)[:max_items]:
-                    compacted_item = compact_value(
-                        item,
-                        max_items=max_items,
-                        max_characters=max_characters,
-                        depth=depth + 1,
-                    )
-
-                    if compacted_item not in (
-                            None,
-                            "",
-                            [],
-                            {},
-                    ):
-                        compacted_items.append(
-                            compacted_item
-                        )
-
-                return compacted_items or None
-
-            return value
-
-        node_type = node.get("node_type")
-
-        fields_by_node_type: dict[
-            str,
-            list[str],
-        ] = {
-            "business_entity": [
-                "entity_id",
-                "aliases",
-                "business_domains",
-                "tables",
-                "subject_areas",
-                "rest_resources",
-                "validated_rules",
-            ],
-            "business_attribute": [
-                "attribute_id",
-                "entity_id",
-                "aliases",
-                "columns",
-                "confidence",
-            ],
-            "physical_table": [
-                "primary_key",
-                "result_grain",
-                "ranking_rules",
-                "business_rules",
-            ],
-            "physical_column": [
-                "qualified_name",
-                "table_name",
-                "datatype",
-                "nullable",
-                "semantics",
-            ],
-            "validated_rule": [
-                "conditions",
-                "ranking",
-                "tables",
-                "columns",
-                "sql_template",
-            ],
-            "functional_section": [
-                "tables",
-                "columns",
-                "attributes",
-                "business_rules",
-            ],
-            "otbi_subject_area": [
-                "subject_areas",
-                "transactional_grain",
-                "time_reporting",
-                "tables",
-                "columns",
-            ],
-            "otbi_business_question": [
-                "subject_areas",
-                "transactional_grain",
-                "time_reporting",
-                "tables",
-                "columns",
-            ],
-            "rest_resource": [
-                "endpoint_path",
-                "method",
-                "resource_hierarchy",
-                "parameters",
-                "attributes",
-            ],
-            "rest_operation": [
-                "endpoint_path",
-                "method",
-                "resource_hierarchy",
-                "parameters",
-                "attributes",
-            ],
-        }
-
-        default_fields = [
+    def _evidence_payload(node: dict[str, Any]) -> dict[str, Any]:
+        allowed = [
             "entity_id",
             "aliases",
             "primary_key",
             "result_grain",
+            "ranking_rules",
+            "business_rules",
             "conditions",
             "ranking",
             "tables",
             "columns",
-            "qualified_name",
+            "sql_template",
+            "transactional_grain",
+            "time_reporting",
+            "subject_areas",
             "endpoint_path",
             "method",
             "resource_hierarchy",
+            "parameters",
+            "attributes",
+            "semantics",
+            "qualified_name",
+            "module_id",
+            "module_name",
+            "modules",
         ]
-
-        selected_fields = fields_by_node_type.get(
-            str(node_type),
-            default_fields,
-        )
-
-        item_limits = {
-            "aliases": 12,
-            "business_domains": 8,
-            "tables": 12,
-            "columns": 20,
-            "subject_areas": 8,
-            "rest_resources": 8,
-            "validated_rules": 8,
-            "ranking_rules": 3,
-            "business_rules": 6,
-            "attributes": 12,
-            "semantics": 4,
-            "parameters": 12,
-            "resource_hierarchy": 8,
-        }
-
-        character_limits = {
-            "sql_template": 1800,
-            "business_rules": 600,
-            "ranking_rules": 600,
-            "semantics": 500,
-            "attributes": 500,
-            "parameters": 500,
-        }
-
-        payload: dict[str, Any] = {}
-
-        for field in selected_fields:
-            value = node.get(field)
-
-            compacted_value = compact_value(
-                value,
-                max_items=item_limits.get(
-                    field,
-                    8,
-                ),
-                max_characters=character_limits.get(
-                    field,
-                    700,
-                ),
-            )
-
-            if compacted_value not in (
-                    None,
-                    "",
-                    [],
-                    {},
-            ):
-                payload[field] = compacted_value
-
-        return payload
+        return {key: node[key] for key in allowed if node.get(key) not in (None, [], {}, "")}
 
 
 def build_parser() -> argparse.ArgumentParser:

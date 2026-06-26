@@ -1,3 +1,5 @@
 beautifulsoup4>=4.12,<5
 requests>=2.31,<3
 urllib3>=2.2,<3
+numpy>=1.26,<3
+sentence-transformers>=5.0,<6
