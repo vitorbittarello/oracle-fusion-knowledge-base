@@ -27,6 +27,14 @@ from oracle_knowledge.linker.graph_layers import (
 )
 from oracle_knowledge.search.hybrid_search import HybridSearch, SearchConfig
 from oracle_knowledge.search.federated_search import FederatedGraphSearch
+from oracle_knowledge.validation import (
+    ValidationReport,
+    render_validation_report,
+    validate_environment,
+    validate_graph_directory,
+    validate_module_directory,
+    validate_search_result,
+)
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "config" / "knowledge_sources.json"
@@ -196,6 +204,67 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="Restringe a busca a um module_id. Pode ser repetido.",
+    )
+
+    doctor = subparsers.add_parser(
+        "doctor",
+        help="Valida ambiente, dependências, UTF-8, SQLite FTS5 e permissões.",
+    )
+    doctor.add_argument("--work-dir", default=".")
+    doctor.add_argument(
+        "--json-output",
+        nargs="?",
+        const="-",
+        help=(
+            "Produz o relatório em JSON. Sem caminho, escreve no stdout; "
+            "com caminho, grava o arquivo informado."
+        ),
+    )
+
+    validate_module = subparsers.add_parser(
+        "validate-module",
+        help="Valida arquivos, JSONs e fontes esperadas de um módulo coletado.",
+    )
+    validate_module.add_argument("--module-dir", required=True)
+    validate_module.add_argument(
+        "--json-output",
+        nargs="?",
+        const="-",
+        help=(
+            "Produz o relatório em JSON. Sem caminho, escreve no stdout; "
+            "com caminho, grava o arquivo informado."
+        ),
+    )
+
+    validate_graph = subparsers.add_parser(
+        "validate-graph",
+        help="Valida o bundle, os grafos, as estatísticas e as arestas.",
+    )
+    validate_graph.add_argument("--graph-dir", required=True)
+    validate_graph.add_argument(
+        "--json-output",
+        nargs="?",
+        const="-",
+        help=(
+            "Produz o relatório em JSON. Sem caminho, escreve no stdout; "
+            "com caminho, grava o arquivo informado."
+        ),
+    )
+
+    validate_result = subparsers.add_parser(
+        "validate-result",
+        help="Valida estrutura, orçamento, fontes e roteamento de um resultado.",
+    )
+    validate_result.add_argument("--result", required=True)
+    validate_result.add_argument("--max-characters", type=int, default=14000)
+    validate_result.add_argument(
+        "--json-output",
+        nargs="?",
+        const="-",
+        help=(
+            "Produz o relatório em JSON. Sem caminho, escreve no stdout; "
+            "com caminho, grava o arquivo informado."
+        ),
     )
 
     return parser
@@ -594,6 +663,55 @@ def search_federated_graphs(args: argparse.Namespace) -> None:
     print(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
+def _emit_validation_report(
+    report: ValidationReport,
+    json_output: str | None,
+) -> None:
+    payload = report.to_dict()
+
+    if json_output == "-":
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        print(render_validation_report(report))
+        if json_output:
+            write_json(json_output, payload)
+            print(f"[JSON] Relatório gravado em {Path(json_output).resolve()}")
+
+    if report.error_count:
+        raise SystemExit(1)
+
+
+def run_doctor(args: argparse.Namespace) -> None:
+    _emit_validation_report(
+        validate_environment(args.work_dir),
+        args.json_output,
+    )
+
+
+def run_validate_module(args: argparse.Namespace) -> None:
+    _emit_validation_report(
+        validate_module_directory(args.module_dir),
+        args.json_output,
+    )
+
+
+def run_validate_graph(args: argparse.Namespace) -> None:
+    _emit_validation_report(
+        validate_graph_directory(args.graph_dir),
+        args.json_output,
+    )
+
+
+def run_validate_result(args: argparse.Namespace) -> None:
+    _emit_validation_report(
+        validate_search_result(
+            args.result,
+            max_characters=args.max_characters,
+        ),
+        args.json_output,
+    )
+
+
 def main() -> None:
     args = build_parser().parse_args()
     if args.command == "collect-module":
@@ -614,6 +732,14 @@ def main() -> None:
         search_graph(args)
     elif args.command == "search-federated":
         search_federated_graphs(args)
+    elif args.command == "doctor":
+        run_doctor(args)
+    elif args.command == "validate-module":
+        run_validate_module(args)
+    elif args.command == "validate-graph":
+        run_validate_graph(args)
+    elif args.command == "validate-result":
+        run_validate_result(args)
     else:
         raise SystemExit(f"Comando desconhecido: {args.command}")
 
