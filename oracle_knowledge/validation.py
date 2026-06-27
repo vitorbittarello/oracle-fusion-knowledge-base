@@ -15,6 +15,14 @@ from oracle_knowledge.linker.graph_layers import (
     GRAPH_FILENAMES,
     MASTER_EDGE_TYPES,
 )
+from oracle_knowledge.indexing import (
+    INDEX_SCHEMA_VERSION,
+    INDEX_USER_VERSION,
+    REQUIRED_SQL_INDEXES,
+    default_index_path,
+    file_sha256,
+    read_index_metadata,
+)
 
 STATUS_OK = "OK"
 STATUS_WARNING = "WARNING"
@@ -839,6 +847,501 @@ def validate_graph_directory(graph_dir: str | Path) -> ValidationReport:
         "bundle_version": bundle.get("version"),
         "generated_at": bundle.get("generated_at"),
     }
+    return report
+
+
+def validate_index_database(
+    index_path: str | Path | None = None,
+    *,
+    graph_dir: str | Path | None = None,
+    full_hash: bool = False,
+) -> ValidationReport:
+    graph_root = Path(graph_dir).resolve() if graph_dir is not None else None
+    path = (
+        Path(index_path).resolve()
+        if index_path is not None
+        else default_index_path(graph_root or Path("."))
+    )
+    report = ValidationReport("index", str(path))
+
+    if graph_root is not None:
+        if graph_root.is_dir():
+            report.ok(
+                "INDEX_GRAPH_DIRECTORY",
+                "Diretório de grafos encontrado.",
+                path=graph_root,
+            )
+        else:
+            report.error(
+                "INDEX_GRAPH_DIRECTORY",
+                "Diretório de grafos não encontrado.",
+                path=graph_root,
+            )
+
+    if not path.exists():
+        report.error(
+            "INDEX_FILE_MISSING",
+            "Índice SQLite não encontrado.",
+            path=path,
+        )
+        return report
+    if not path.is_file():
+        report.error(
+            "INDEX_FILE_INVALID",
+            "O caminho do índice não é um arquivo.",
+            path=path,
+        )
+        return report
+
+    report.ok(
+        "INDEX_FILE_EXISTS",
+        "Índice SQLite encontrado.",
+        path=path,
+        details=_size_details(path),
+    )
+
+    try:
+        connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        report.error(
+            "INDEX_OPEN_FAILED",
+            f"Não foi possível abrir o índice SQLite: {exc}",
+            path=path,
+        )
+        return report
+
+    try:
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+        integrity_value = str(integrity[0]) if integrity else "unknown"
+        if integrity_value == "ok":
+            report.ok(
+                "INDEX_INTEGRITY",
+                "PRAGMA integrity_check retornou ok.",
+                path=path,
+            )
+        else:
+            report.error(
+                "INDEX_INTEGRITY",
+                "O SQLite reportou falha de integridade.",
+                path=path,
+                details={"result": integrity_value},
+            )
+
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
+            )
+        }
+        required_tables = {
+            "index_metadata",
+            "graph_files",
+            "nodes",
+            "node_modules",
+            "edges",
+            "nodes_fts",
+        }
+        missing_tables = sorted(required_tables - tables)
+        if missing_tables:
+            report.error(
+                "INDEX_SCHEMA_TABLES",
+                "O índice não contém todas as estruturas obrigatórias.",
+                path=path,
+                details={"missing": missing_tables},
+            )
+            return report
+        report.ok(
+            "INDEX_SCHEMA_TABLES",
+            "Todas as estruturas obrigatórias foram encontradas.",
+            path=path,
+        )
+
+        metadata = read_index_metadata(connection)
+        schema_version = metadata.get("schema_version")
+        if schema_version != INDEX_SCHEMA_VERSION:
+            report.error(
+                "INDEX_SCHEMA_VERSION",
+                "Versão do esquema do índice incompatível.",
+                path=path,
+                details={
+                    "expected": INDEX_SCHEMA_VERSION,
+                    "actual": schema_version,
+                },
+            )
+        else:
+            report.ok(
+                "INDEX_SCHEMA_VERSION",
+                "Versão do esquema do índice compatível.",
+                path=path,
+                details={"version": schema_version},
+            )
+
+        user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+        if user_version != INDEX_USER_VERSION:
+            report.error(
+                "INDEX_USER_VERSION",
+                "PRAGMA user_version incompatível.",
+                path=path,
+                details={
+                    "expected": INDEX_USER_VERSION,
+                    "actual": user_version,
+                },
+            )
+        else:
+            report.ok(
+                "INDEX_USER_VERSION",
+                "PRAGMA user_version compatível.",
+                path=path,
+                details={"version": user_version},
+            )
+
+        sql_indexes = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index'"
+            )
+        }
+        missing_indexes = sorted(REQUIRED_SQL_INDEXES - sql_indexes)
+        if missing_indexes:
+            report.error(
+                "INDEX_SQL_INDEXES",
+                "Existem índices SQL obrigatórios ausentes.",
+                path=path,
+                details={"missing": missing_indexes},
+            )
+        else:
+            report.ok(
+                "INDEX_SQL_INDEXES",
+                "Índices SQL obrigatórios encontrados.",
+                path=path,
+                details={"count": len(REQUIRED_SQL_INDEXES)},
+            )
+
+        counts = {
+            "nodes": int(connection.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]),
+            "edges": int(connection.execute("SELECT COUNT(*) FROM edges").fetchone()[0]),
+            "node_modules": int(
+                connection.execute("SELECT COUNT(*) FROM node_modules").fetchone()[0]
+            ),
+            "nodes_fts": int(
+                connection.execute("SELECT COUNT(*) FROM nodes_fts").fetchone()[0]
+            ),
+        }
+
+        declared_counts = {
+            "nodes": metadata.get("node_count"),
+            "edges": metadata.get("edge_count"),
+            "node_modules": metadata.get("module_link_count"),
+            "nodes_fts": metadata.get("fts_row_count"),
+        }
+        mismatches = {
+            key: {"declared": declared_counts[key], "actual": actual}
+            for key, actual in counts.items()
+            if declared_counts.get(key) != actual
+        }
+        if mismatches:
+            report.error(
+                "INDEX_METADATA_COUNTS",
+                "As contagens do índice divergem dos metadados.",
+                path=path,
+                details={"mismatches": mismatches},
+            )
+        else:
+            report.ok(
+                "INDEX_METADATA_COUNTS",
+                "As contagens do índice correspondem aos metadados.",
+                path=path,
+                details=counts,
+            )
+
+        if counts["nodes_fts"] != counts["nodes"]:
+            report.error(
+                "INDEX_FTS_COVERAGE",
+                "A quantidade de linhas FTS5 difere da quantidade de nós.",
+                path=path,
+                details={
+                    "nodes": counts["nodes"],
+                    "fts_rows": counts["nodes_fts"],
+                },
+            )
+        else:
+            report.ok(
+                "INDEX_FTS_COVERAGE",
+                "Todos os nós possuem uma linha no FTS5.",
+                path=path,
+                details={"count": counts["nodes_fts"]},
+            )
+
+        try:
+            connection.execute(
+                "SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ? LIMIT 1",
+                ('"validation"',),
+            ).fetchall()
+        except sqlite3.Error as exc:
+            report.error(
+                "INDEX_FTS_QUERY",
+                f"O FTS5 não conseguiu executar uma consulta: {exc}",
+                path=path,
+            )
+        else:
+            report.ok(
+                "INDEX_FTS_QUERY",
+                "O FTS5 executou uma consulta de validação.",
+                path=path,
+            )
+
+        orphan_edges = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                  FROM edges e
+             LEFT JOIN nodes s ON s.node_pk = e.source_node_pk
+             LEFT JOIN nodes t ON t.node_pk = e.target_node_pk
+                 WHERE s.node_pk IS NULL OR t.node_pk IS NULL
+                """
+            ).fetchone()[0]
+        )
+        if orphan_edges:
+            report.error(
+                "INDEX_ORPHAN_EDGES",
+                "Existem arestas órfãs no índice.",
+                path=path,
+                details={"count": orphan_edges},
+            )
+        else:
+            report.ok(
+                "INDEX_ORPHAN_EDGES",
+                "Nenhuma aresta órfã foi encontrada.",
+                path=path,
+            )
+
+        orphan_modules = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                  FROM node_modules m
+             LEFT JOIN nodes n ON n.node_pk = m.node_pk
+                 WHERE n.node_pk IS NULL
+                """
+            ).fetchone()[0]
+        )
+        if orphan_modules:
+            report.error(
+                "INDEX_ORPHAN_MODULES",
+                "Existem vínculos de módulo órfãos no índice.",
+                path=path,
+                details={"count": orphan_modules},
+            )
+        else:
+            report.ok(
+                "INDEX_ORPHAN_MODULES",
+                "Nenhum vínculo de módulo órfão foi encontrado.",
+                path=path,
+            )
+
+        bundle_metadata = metadata.get("graph_bundle")
+        if not isinstance(bundle_metadata, dict):
+            report.error(
+                "INDEX_BUNDLE_METADATA",
+                "O índice não contém metadados do graph_bundle.json.",
+                path=path,
+            )
+        else:
+            bundle_source = (
+                graph_root / "graph_bundle.json"
+                if graph_root is not None
+                else Path(str(bundle_metadata.get("path") or ""))
+            )
+            if not bundle_source.is_file():
+                report.error(
+                    "INDEX_BUNDLE_SOURCE",
+                    "graph_bundle.json usado na construção não foi encontrado.",
+                    path=bundle_source,
+                )
+            else:
+                bundle_stat = bundle_source.stat()
+                bundle_stale = (
+                    bundle_stat.st_size != int(bundle_metadata.get("size_bytes") or -1)
+                    or bundle_stat.st_mtime_ns != int(bundle_metadata.get("modified_ns") or -1)
+                )
+                if not bundle_stale and full_hash:
+                    bundle_stale = (
+                        file_sha256(bundle_source)
+                        != str(bundle_metadata.get("sha256") or "")
+                    )
+                if bundle_stale:
+                    report.error(
+                        "INDEX_BUNDLE_STALE",
+                        "O índice está desatualizado em relação ao graph_bundle.json.",
+                        path=bundle_source,
+                    )
+                else:
+                    report.ok(
+                        "INDEX_BUNDLE_FRESHNESS",
+                        "O graph_bundle.json corresponde ao índice.",
+                        path=bundle_source,
+                        details={"full_hash": full_hash},
+                    )
+
+        graph_rows = connection.execute(
+            """
+            SELECT graph_layer, filename, source_path, size_bytes,
+                   modified_ns, sha256, node_count, edge_count
+              FROM graph_files
+          ORDER BY graph_layer
+            """
+        ).fetchall()
+        if len(graph_rows) != len(GRAPH_FILENAMES):
+            report.error(
+                "INDEX_GRAPH_FILE_COUNT",
+                "A quantidade de grafos indexados é incompatível.",
+                path=path,
+                details={
+                    "expected": len(GRAPH_FILENAMES),
+                    "actual": len(graph_rows),
+                },
+            )
+        else:
+            report.ok(
+                "INDEX_GRAPH_FILE_COUNT",
+                "Todos os grafos esperados estão registrados no índice.",
+                path=path,
+                details={"count": len(graph_rows)},
+            )
+
+        stale_files: list[dict[str, Any]] = []
+        missing_files: list[str] = []
+        count_mismatches: list[dict[str, Any]] = []
+        for (
+            layer,
+            filename,
+            source_path,
+            size_bytes,
+            modified_ns,
+            stored_hash,
+            declared_nodes,
+            declared_edges,
+        ) in graph_rows:
+            expected_filename = GRAPH_FILENAMES.get(str(layer))
+            if expected_filename != filename:
+                stale_files.append(
+                    {
+                        "layer": layer,
+                        "reason": "filename",
+                        "expected": expected_filename,
+                        "actual": filename,
+                    }
+                )
+
+            source = (
+                graph_root / str(filename)
+                if graph_root is not None
+                else Path(str(source_path))
+            )
+            if not source.is_file():
+                missing_files.append(str(source))
+                continue
+
+            stat = source.stat()
+            if stat.st_size != int(size_bytes) or stat.st_mtime_ns != int(modified_ns):
+                stale_files.append(
+                    {
+                        "layer": layer,
+                        "reason": "size_or_modified_time",
+                        "path": str(source),
+                        "stored_size": int(size_bytes),
+                        "current_size": stat.st_size,
+                        "stored_modified_ns": int(modified_ns),
+                        "current_modified_ns": stat.st_mtime_ns,
+                    }
+                )
+            elif full_hash:
+                current_hash = file_sha256(source)
+                if current_hash != stored_hash:
+                    stale_files.append(
+                        {
+                            "layer": layer,
+                            "reason": "sha256",
+                            "path": str(source),
+                            "stored": stored_hash,
+                            "current": current_hash,
+                        }
+                    )
+
+            database_counts = connection.execute(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM nodes WHERE graph_layer = ?),
+                    (SELECT COUNT(*) FROM edges WHERE graph_layer = ?)
+                """,
+                (layer, layer),
+            ).fetchone()
+            if (
+                int(database_counts[0]) != int(declared_nodes)
+                or int(database_counts[1]) != int(declared_edges)
+            ):
+                count_mismatches.append(
+                    {
+                        "layer": layer,
+                        "declared_nodes": int(declared_nodes),
+                        "actual_nodes": int(database_counts[0]),
+                        "declared_edges": int(declared_edges),
+                        "actual_edges": int(database_counts[1]),
+                    }
+                )
+
+        if missing_files:
+            report.error(
+                "INDEX_SOURCE_FILES_MISSING",
+                "Existem grafos de origem ausentes.",
+                path=path,
+                details={"files": missing_files},
+            )
+        elif stale_files:
+            report.error(
+                "INDEX_STALE",
+                "O índice está desatualizado em relação aos grafos de origem.",
+                path=path,
+                details={"files": stale_files},
+            )
+        else:
+            report.ok(
+                "INDEX_FRESHNESS",
+                "O índice corresponde aos arquivos de grafo atuais.",
+                path=path,
+                details={"full_hash": full_hash},
+            )
+
+        if count_mismatches:
+            report.error(
+                "INDEX_LAYER_COUNTS",
+                "As contagens por camada estão inconsistentes.",
+                path=path,
+                details={"layers": count_mismatches},
+            )
+        else:
+            report.ok(
+                "INDEX_LAYER_COUNTS",
+                "As contagens por camada estão consistentes.",
+                path=path,
+            )
+
+        report.metadata = {
+            "index_path": str(path),
+            "graph_dir": str(graph_root) if graph_root is not None else metadata.get("graph_dir"),
+            "schema_version": schema_version,
+            "counts": counts,
+            "full_hash": full_hash,
+        }
+    except sqlite3.DatabaseError as exc:
+        report.error(
+            "INDEX_DATABASE_ERROR",
+            f"Falha ao validar o banco SQLite: {exc}",
+            path=path,
+        )
+    finally:
+        connection.close()
+
     return report
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -25,6 +26,7 @@ from oracle_knowledge.linker.graph_layers import (
     build_graph_bundle_from_graph,
     write_graph_bundle,
 )
+from oracle_knowledge.indexing import build_search_index, default_index_path
 from oracle_knowledge.search.hybrid_search import HybridSearch, SearchConfig
 from oracle_knowledge.search.federated_search import FederatedGraphSearch
 from oracle_knowledge.validation import (
@@ -32,6 +34,7 @@ from oracle_knowledge.validation import (
     render_validation_report,
     validate_environment,
     validate_graph_directory,
+    validate_index_database,
     validate_module_directory,
     validate_search_result,
 )
@@ -204,6 +207,47 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="Restringe a busca a um module_id. Pode ser repetido.",
+    )
+
+    build_index = subparsers.add_parser(
+        "build-index",
+        help="Constrói um índice SQLite + FTS5 a partir dos grafos separados.",
+    )
+    build_index.add_argument("--graph-dir", required=True)
+    build_index.add_argument(
+        "--output",
+        help=(
+            "Arquivo SQLite de saída. O padrão é "
+            "<graph-dir>/search_index/knowledge_index.sqlite."
+        ),
+    )
+    build_index.add_argument("--batch-size", type=int, default=1000)
+
+    validate_index = subparsers.add_parser(
+        "validate-index",
+        help="Valida esquema, FTS5, contagens e atualização do índice SQLite.",
+    )
+    validate_index.add_argument("--graph-dir", required=True)
+    validate_index.add_argument(
+        "--index",
+        help=(
+            "Arquivo SQLite a validar. O padrão é "
+            "<graph-dir>/search_index/knowledge_index.sqlite."
+        ),
+    )
+    validate_index.add_argument(
+        "--full-hash",
+        action="store_true",
+        help="Recalcula SHA-256 dos grafos para detectar alterações de conteúdo.",
+    )
+    validate_index.add_argument(
+        "--json-output",
+        nargs="?",
+        const="-",
+        help=(
+            "Produz o relatório em JSON. Sem caminho, escreve no stdout; "
+            "com caminho, grava o arquivo informado."
+        ),
     )
 
     doctor = subparsers.add_parser(
@@ -663,6 +707,17 @@ def search_federated_graphs(args: argparse.Namespace) -> None:
     print(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
+def run_build_index(args: argparse.Namespace) -> None:
+    output_path = Path(args.output).resolve() if args.output else default_index_path(args.graph_dir)
+    result = build_search_index(
+        args.graph_dir,
+        output_path,
+        batch_size=args.batch_size,
+        progress=lambda message: print(message, file=sys.stderr, flush=True),
+    )
+    print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+
+
 def _emit_validation_report(
     report: ValidationReport,
     json_output: str | None,
@@ -691,6 +746,18 @@ def run_doctor(args: argparse.Namespace) -> None:
 def run_validate_module(args: argparse.Namespace) -> None:
     _emit_validation_report(
         validate_module_directory(args.module_dir),
+        args.json_output,
+    )
+
+
+def run_validate_index(args: argparse.Namespace) -> None:
+    index_path = Path(args.index).resolve() if args.index else default_index_path(args.graph_dir)
+    _emit_validation_report(
+        validate_index_database(
+            index_path,
+            graph_dir=args.graph_dir,
+            full_hash=args.full_hash,
+        ),
         args.json_output,
     )
 
@@ -732,6 +799,10 @@ def main() -> None:
         search_graph(args)
     elif args.command == "search-federated":
         search_federated_graphs(args)
+    elif args.command == "build-index":
+        run_build_index(args)
+    elif args.command == "validate-index":
+        run_validate_index(args)
     elif args.command == "doctor":
         run_doctor(args)
     elif args.command == "validate-module":
