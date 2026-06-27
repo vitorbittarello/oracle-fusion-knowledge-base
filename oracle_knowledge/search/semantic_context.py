@@ -31,6 +31,11 @@ class SemanticContextConfig:
     maximum_segment_characters: int = 900
     summary_max_characters: int = 500
     mmr_lambda: float = 0.82
+    candidate_rerank_weight: float = 0.72
+    candidate_minimum_relative_score: float = 0.45
+    candidate_preserve_top_results: int = 4
+    candidate_group_score_ratio: float = 0.10
+    candidate_top_segments: int = 2
 
 
 @dataclass(frozen=True)
@@ -288,6 +293,112 @@ class SemanticTextSelector:
             )
             for index in selected_indexes
         ]
+
+    def score_documents(
+        self,
+        query: str,
+        documents: list[str | None],
+        *,
+        top_segments: int | None = None,
+    ) -> list[float]:
+        """
+        Calcula a relevância semântica de vários documentos para a consulta.
+
+        Cada documento é dividido em trechos, todos os trechos são codificados
+        em uma única chamada em lote e a pontuação do documento corresponde à
+        média dos trechos mais relevantes. Isso evita que uma descrição longa
+        seja prejudicada por conteúdo técnico pouco relacionado e permite que
+        um trecho realmente útil determine a relevância do candidato.
+
+        O método não gera nem reescreve conteúdo. A lista devolvida mantém a
+        mesma ordem da lista ``documents``.
+        """
+        if not documents:
+            return []
+
+        if not query.strip():
+            return [0.0 for _ in documents]
+
+        requested_top_segments = max(
+            1,
+            int(
+                top_segments
+                or self.config.candidate_top_segments
+            ),
+        )
+        all_segments: list[str] = []
+        document_segment_indexes: list[list[int]] = []
+
+        for document in documents:
+            normalized = re.sub(
+                r"\s+",
+                " ",
+                document or "",
+            ).strip()
+
+            if not normalized:
+                document_segment_indexes.append([])
+                continue
+
+            segments = self._split_text(normalized)
+
+            if not segments:
+                segments = [normalized]
+
+            indexes: list[int] = []
+
+            for segment in segments:
+                indexes.append(len(all_segments))
+                all_segments.append(segment)
+
+            document_segment_indexes.append(indexes)
+
+        if not all_segments:
+            return [0.0 for _ in documents]
+
+        model = self._load_model()
+        formatted_query = self._format_query(query)
+        query_embedding = model.encode(
+            [formatted_query],
+            batch_size=self.config.batch_size,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+        segment_embeddings = model.encode(
+            all_segments,
+            batch_size=self.config.batch_size,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+        query_vector = self._normalize_embeddings(
+            query_embedding
+        )[0]
+        segment_vectors = self._normalize_embeddings(
+            segment_embeddings
+        )
+        segment_scores = segment_vectors @ query_vector
+        document_scores: list[float] = []
+
+        for indexes in document_segment_indexes:
+            if not indexes:
+                document_scores.append(0.0)
+                continue
+
+            scores = sorted(
+                (
+                    float(segment_scores[index])
+                    for index in indexes
+                ),
+                reverse=True,
+            )
+            selected_scores = scores[:requested_top_segments]
+            document_scores.append(
+                sum(selected_scores) / len(selected_scores)
+            )
+
+        return document_scores
 
     def select_relevant_text(
         self,

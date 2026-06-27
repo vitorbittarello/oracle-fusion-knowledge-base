@@ -1,619 +1,996 @@
-# Manual do Usuário de Negócio
+# Manual do Usuário
 
 ## Oracle Fusion Knowledge Base
 
-Este manual explica como um usuário de negócio pode usar a ferramenta de apoio ao entendimento do Oracle Fusion Cloud Applications.
+Este manual explica como usar a ferramenta para localizar documentação relevante do Oracle Fusion Cloud Applications e produzir um contexto mais limpo para análise funcional, descoberta de fontes e geração de SQL.
 
-A ferramenta não substitui o Oracle Fusion, o OTBI, o BI Publisher ou o banco de dados. Ela funciona como uma base de conhecimento para ajudar a entender tabelas, colunas, relacionamentos, regras e caminhos possíveis para responder perguntas de negócio.
+Os exemplos de execução são apresentados em **Bash** e **PowerShell**. No Bash, a continuação de linha usa `\`; no PowerShell, usa crase (`` ` ``).
 
 ---
 
-## 1. Objetivo da ferramenta
+## 1. Para que serve
 
 A ferramenta ajuda a responder perguntas como:
 
-- Onde encontro determinada informação no Oracle Fusion?
-- Quais tabelas parecem estar relacionadas a um assunto?
-- Quais colunas indicam status, datas, valores, versões ou auditoria?
-- Existe alguma regra conhecida para identificar registros vigentes?
-- Quais módulos podem estar envolvidos em uma análise?
-- Como montar um contexto mais confiável para gerar uma consulta SQL?
-- Quais documentos oficiais da Oracle ajudam a entender determinado tema?
+- onde determinado dado está documentado;
+- quais tabelas e colunas são candidatas;
+- quais relacionamentos podem ligar os objetos;
+- qual subject area do OTBI trata do assunto;
+- qual recurso REST pode atender à necessidade;
+- quais regras já foram validadas;
+- qual é o grão documentado;
+- quais pontos ainda precisam de validação funcional.
 
-O foco é apoiar análise, descoberta e entendimento do modelo de dados do Oracle Fusion Cloud Applications.
-
----
-
-## 2. O que a ferramenta faz
-
-A ferramenta coleta e organiza informações públicas da documentação oficial da Oracle e de regras validadas internamente.
-
-Ela pode usar fontes como:
-
-- dicionário físico de tabelas e views;
-- documentação funcional;
-- documentação OTBI;
-- documentação REST API;
-- regras validadas pela equipe;
-- aliases de negócio cadastrados no projeto;
-- relacionamentos entre tabelas de diferentes módulos.
-
-Com isso, ela monta uma base pesquisável.
+Ela não envia a documentação completa do módulo para uma LLM. Primeiro seleciona uma rota e depois recupera apenas as evidências mais pertinentes.
 
 ---
 
-## 3. O que a ferramenta não faz
+## 2. O que a ferramenta não faz
 
-A ferramenta não executa consultas no banco de dados.
+A ferramenta:
 
-Ela também não garante, sozinha, que uma resposta esteja 100% correta para o ambiente da empresa.
+- não consulta dados transacionais;
+- não executa SQL no banco;
+- não substitui o BI Publisher, o OTBI ou o Oracle Fusion;
+- não garante que uma inferência seja uma regra de negócio;
+- não conhece customizações que não tenham sido documentadas;
+- não elimina a necessidade de validação funcional;
+- não deve inventar joins, filtros ou significados de códigos.
 
-Ela não substitui validação funcional.
-
-Ela não deve ser usada como fonte única para tomada de decisão sem conferência.
-
-Ela não acessa dados transacionais do Fusion. Ela trabalha com documentação e metadados.
-
----
-
-## 4. Quando usar
-
-Use a ferramenta quando houver perguntas como:
-
-- "Quais tabelas tratam de orçamento de projeto?"
-- "Como identifico a versão aprovada de um orçamento?"
-- "Quais tabelas ligam projetos e unidades de negócio?"
-- "Onde encontro informações de fornecedores?"
-- "Quais campos parecem controlar vigência?"
-- "Qual tabela pode conter status de uma requisição?"
-- "Quais módulos podem estar envolvidos nessa análise?"
-- "Que contexto devo passar para gerar uma SQL mais segura?"
-
-A ferramenta é especialmente útil no início de uma análise, quando ainda não está claro onde procurar.
+O resultado é um **contexto de apoio**, não uma homologação automática.
 
 ---
 
-## 5. Como formular boas perguntas
+## 3. Como o conhecimento está organizado
 
-Perguntas boas são objetivas e usam termos de negócio.
+A documentação é separada em grafos com papéis diferentes.
 
-### Exemplos bons
-
-```text
-quais projetos estão sem orçamento aprovado
-```
+### Negócio
 
 ```text
-onde encontro as versões de orçamento de projeto
+business.json
 ```
+
+Reúne:
+
+- entidades;
+- atributos;
+- regras validadas;
+- trechos funcionais.
+
+### Modelo físico
 
 ```text
-quais tabelas relacionam projeto com unidade de negócio
+physical.json
 ```
+
+Reúne:
+
+- tabelas;
+- views;
+- colunas;
+- chaves;
+- relacionamentos;
+- grão documentado.
+
+### OTBI analítico
 
 ```text
-como identificar a versão vigente de um plano financeiro
+otbi_analytics.json
 ```
+
+Reúne:
+
+- subject areas;
+- perguntas de negócio;
+- páginas analíticas.
+
+### Segurança OTBI
 
 ```text
-quais campos indicam data de início e fim de validade
+otbi_security.json
 ```
+
+Reúne:
+
+- job roles;
+- duty roles;
+- privilégios;
+- páginas de segurança.
+
+Essa camada não entra na busca padrão de datasets e SQL.
+
+### REST
 
 ```text
-quais tabelas de fornecedores se relacionam com invoices
+rest.json
 ```
 
-### Exemplos fracos
+Reúne:
+
+- recursos;
+- operações;
+- endpoints;
+- parâmetros e atributos.
+
+### Grafo mestre
 
 ```text
-me ajuda
+master_graph.json
 ```
 
-```text
-onde está isso
-```
+É um mapa pequeno com as principais interseções entre negócio, modelo físico, OTBI e REST.
+
+---
+
+## 4. Como funciona uma busca
+
+A busca federada segue este caminho:
 
 ```text
-faz uma query
+pergunta de negócio
+        ↓
+conceitos reconhecidos no master
+        ↓
+pontes documentadas ou curadas
+        ↓
+tabelas, colunas, subject areas e recursos REST
+        ↓
+expansão local
+        ↓
+contexto final
 ```
+
+Exemplo:
+
+```text
+Condições de pagamento
+        ↓
+Payment Terms
+        ↓
+PO_HEADERS_ALL.TERMS_ID
+        ↓
+tabela referenciada de condições de pagamento
+```
+
+A ferramenta evita percorrer toda a documentação apenas porque um texto contém palavras parecidas.
+
+---
+
+## 5. Quando usar
+
+Use a ferramenta no início ou durante uma análise quando precisar:
+
+- descobrir fontes candidatas;
+- validar se uma tabela está ligada ao assunto;
+- encontrar colunas de valor, status, datas ou identificadores;
+- verificar referências físicas;
+- localizar subject areas;
+- localizar recursos REST;
+- criar um contexto para uma IA gerar ou revisar SQL;
+- registrar uma regra validada para uso futuro.
+
+---
+
+## 6. Como formular uma boa pergunta
+
+Inclua, sempre que possível:
+
+- módulo;
+- processo de negócio;
+- objeto principal;
+- campos desejados;
+- grão esperado;
+- histórico ou posição atual;
+- tipo de fonte procurada;
+- resultado desejado.
+
+### Pergunta fraca
 
 ```text
 qual tabela usar
 ```
 
-Essas perguntas são vagas demais.
-
----
-
-## 6. Como melhorar uma pergunta
-
-Inclua sempre que possível:
-
-- o processo de negócio;
-- o módulo;
-- o objeto principal;
-- o resultado esperado;
-- se deseja regra vigente, histórico ou último registro;
-- se precisa de SQL, explicação ou apenas indicação de tabelas.
-
-### Exemplo ruim
+### Pergunta melhor
 
 ```text
-orçamento
+no Procurement, quais tabelas e colunas representam acordo de compra, fornecedor, valor liberado e condições de pagamento
 ```
 
-### Exemplo melhor
+### Pergunta ainda melhor
 
 ```text
-quais tabelas e regras ajudam a identificar o orçamento aprovado vigente de cada projeto
-```
-
-### Exemplo ainda melhor
-
-```text
-quero identificar projetos sem orçamento aprovado vigente no módulo Project Management
+preciso de um dataset com uma linha por acordo de compra contendo fornecedor, valor do acordo, valor liberado, moeda, status, vigência e condição de pagamento
 ```
 
 ---
 
-## 7. Tipos de saída esperados
-
-A ferramenta pode retornar um contexto com informações como:
-
-- entidades relacionadas;
-- tabelas candidatas;
-- colunas importantes;
-- relacionamentos;
-- regras validadas;
-- documentação relacionada;
-- grão sugerido;
-- possíveis filtros;
-- alertas e limitações.
-
-Exemplo de saída esperada:
-
-```text
-Entidade relacionada:
-- Financial Plan Version
-
-Tabelas:
-- PJO_PLAN_VERSIONS_VL
-- PJF_PROJECTS_ALL_B
-
-Regra validada:
-- PLAN_CLASS_CODE = 'BUDGET'
-- PLAN_STATUS_CODE = 'B'
-- CURRENT_PLAN_STATUS_FLAG = 'Y'
-- PROCESSING_TIME IS NOT NULL
-
-Estratégia sugerida:
-- Partir da tabela de projetos
-- Verificar ausência de orçamento aprovado com NOT EXISTS
-```
-
-Essa saída é um contexto de apoio. Ela pode ser usada por uma pessoa ou por uma IA para gerar uma resposta final mais assertiva.
-
----
-
-## 8. Contexto não é resposta final
-
-Quando a ferramenta retorna um contexto, ela está dizendo:
-
-> "Estas são as informações mais relevantes que encontrei para responder sua pergunta."
-
-Ela ainda não está necessariamente entregando a resposta final.
-
-Por exemplo, para a pergunta:
-
-```text
-quais projetos estão sem orçamento aprovado
-```
-
-A ferramenta pode retornar:
-
-- quais tabelas usar;
-- quais filtros indicam orçamento aprovado;
-- quais relacionamentos existem;
-- qual estratégia de consulta usar.
-
-Mas ela não lista os projetos reais, porque não executa consulta no banco.
-
----
-
-## 9. Como interpretar a confiança
-
-A ferramenta pode classificar informações por origem e confiança.
-
-### Alta confiança
-
-Informações vindas de:
-
-- documentação oficial da Oracle;
-- chave primária documentada;
-- relacionamento documentado;
-- regra validada internamente.
-
-### Média confiança
-
-Informações inferidas a partir de:
-
-- nomes de colunas;
-- padrões comuns do Oracle Fusion;
-- combinação entre documentação e estrutura física.
-
-### Baixa confiança
-
-Informações sugeridas por:
-
-- semelhança textual;
-- termos aproximados;
-- aliases incompletos;
-- ausência de regra validada.
-
-Sempre dê mais peso a regras validadas e documentação oficial.
-
----
-
-## 10. Regras validadas
-
-Regras validadas são conhecimentos já confirmados pela equipe.
-
-Exemplo:
-
-```text
-Para identificar orçamento aprovado vigente:
-- PLAN_CLASS_CODE = 'BUDGET'
-- PLAN_STATUS_CODE = 'B'
-- CURRENT_PLAN_STATUS_FLAG = 'Y'
-- PROCESSING_TIME IS NOT NULL
-```
-
-Esse tipo de regra tem mais valor do que uma simples inferência pelo nome da coluna.
-
-Se uma regra foi validada em produção ou homologação, ela deve ser cadastrada no projeto para reaproveitamento futuro.
-
----
-
-## 11. Múltiplos módulos
-
-O Oracle Fusion é dividido em módulos, mas os dados frequentemente se conectam entre eles.
-
-Exemplos:
-
-- Project Management pode se relacionar com Applications Common;
-- Financials pode se relacionar com Procurement;
-- Procurement pode se relacionar com Suppliers;
-- módulos diferentes podem compartilhar tabelas comuns.
-
-Por isso, a ferramenta permite coletar mais de um módulo e pesquisar entre eles.
-
-O módulo **Applications Common** é importante porque costuma conter estruturas compartilhadas entre vários módulos.
-
----
-
-## 12. Exemplos de perguntas por módulo
+## 7. Exemplos de perguntas
 
 ### Project Management
 
 ```text
-quais tabelas armazenam orçamento de projeto
+quais tabelas e regras identificam o orçamento aprovado vigente de cada projeto
 ```
 
 ```text
-como identificar a versão aprovada do orçamento do projeto
-```
-
-```text
-quais projetos estão sem orçamento aprovado
-```
-
-```text
-quais tabelas ligam projeto, tarefa e plano financeiro
-```
-
-### Applications Common
-
-```text
-quais tabelas comuns armazenam unidades de negócio
-```
-
-```text
-onde encontro organizações usadas por outros módulos
-```
-
-```text
-quais tabelas comuns se relacionam com projetos
-```
-
-### Financials
-
-```text
-quais tabelas armazenam invoices de fornecedores
-```
-
-```text
-onde encontro status de uma invoice
-```
-
-```text
-quais campos indicam data contábil e data de criação
+quais projetos não possuem orçamento aprovado vigente
 ```
 
 ### Procurement
 
 ```text
-quais tabelas armazenam requisições de compra
+quais fontes representam acordo de compra, fornecedor, valor liberado e condição de pagamento
 ```
 
 ```text
-como relacionar requisição com ordem de compra
+como relacionar uma requisição com a ordem de compra correspondente
 ```
+
+### SCM — Manufacturing
 
 ```text
-onde encontro aprovador de uma requisição
+qual tabela armazena ordens de produção e qual coluna identifica o número da ordem
 ```
 
----
-
-## 13. Como usar o resultado em uma conversa com IA
-
-Depois de gerar o contexto, ele pode ser usado em uma pergunta para uma IA.
-
-Exemplo:
+### SCM — Product Management
 
 ```text
-Com base no contexto abaixo, gere uma SQL Oracle para identificar projetos sem orçamento aprovado vigente.
-
-[cole aqui o contexto gerado pela ferramenta]
+quais tabelas representam itens por organização e qual coluna contém o número do item
 ```
 
-Isso tende a produzir uma resposta melhor do que perguntar diretamente:
+### SCM — Inventory
 
 ```text
-gere uma SQL para projetos sem orçamento aprovado
+qual recurso REST consulta disponibilidade de itens por subinventário
 ```
-
-Sem contexto, a IA pode inventar tabela, coluna ou filtro.
-
----
-
-## 14. Boas práticas
-
-### Use perguntas específicas
-
-Prefira:
-
-```text
-como identificar orçamento aprovado vigente por projeto
-```
-
-Em vez de:
-
-```text
-orçamento
-```
-
-### Informe o módulo quando souber
-
-Prefira:
-
-```text
-no Project Management, quais tabelas armazenam orçamento aprovado
-```
-
-### Peça o tipo de saída desejada
-
-Exemplos:
-
-```text
-retorne apenas tabelas candidatas
-```
-
-```text
-retorne contexto para gerar SQL
-```
-
-```text
-explique a regra de negócio
-```
-
-```text
-indique possíveis relacionamentos
-```
-
-### Valide regras críticas
-
-Filtros de status, vigência, versão e aprovação devem ser validados com usuário funcional ou consulta já homologada.
-
----
-
-## 15. Cuidados importantes
-
-### Nem toda coluna com `_FLAG` significa `Y/N`
-
-Algumas flags podem usar outros valores. Verifique a descrição documentada ou dados reais.
-
-### Nem todo campo `STATUS_CODE` é autoexplicativo
-
-O significado dos códigos pode depender de lookup, documentação funcional ou configuração do ambiente.
-
-### `OBJECT_VERSION_NUMBER` não é versão de negócio
-
-Em geral, esse campo é usado para controle técnico de concorrência. Não deve ser usado automaticamente para escolher o registro mais recente do negócio.
-
-### Chave primária não é necessariamente o grão analítico
-
-A chave primária indica unicidade física. O grão de uma análise pode ser diferente.
-
-### Documentação oficial não cobre customizações
-
-A ferramenta não conhece extensões, views customizadas ou regras internas se elas não forem cadastradas.
-
----
-
-## 16. Glossário rápido
-
-### Entidade de negócio
-
-Objeto compreendido pelo usuário funcional.
-
-Exemplos:
-
-- Projeto;
-- Orçamento;
-- Fornecedor;
-- Invoice;
-- Requisição;
-- Ordem de compra.
-
-### Tabela física
-
-Tabela ou view documentada pela Oracle.
-
-Exemplo:
-
-```text
-PJO_PLAN_VERSIONS_VL
-```
-
-### Coluna
-
-Campo dentro de uma tabela.
-
-Exemplo:
-
-```text
-PLAN_STATUS_CODE
-```
-
-### Regra validada
-
-Regra confirmada por análise técnica, validação funcional ou uso em produção.
 
 ### OTBI
 
-Camada analítica do Oracle Fusion usada para relatórios e subject areas.
+```text
+qual subject area permite analisar custos reais e estimados por ordem de produção
+```
 
-### REST API
+---
 
-Interface de serviços usada para consultar ou manipular recursos do Oracle Fusion.
+## 8. Executar uma busca federada
 
-### Grão
+Antes da execução, configure UTF-8:
 
-Nível de detalhe de uma resposta.
+#### Bash
 
-Exemplos:
+```bash
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+```
 
-- uma linha por projeto;
-- uma linha por projeto e versão;
-- uma linha por fornecedor e invoice;
-- uma linha por requisição e linha.
+#### PowerShell
 
-### Ranking
+```powershell
+$utf8 = [System.Text.UTF8Encoding]::new()
 
-Critério usado para escolher um registro entre vários candidatos.
+[Console]::InputEncoding = $utf8
+[Console]::OutputEncoding = $utf8
+$OutputEncoding = $utf8
+
+$env:PYTHONUTF8 = "1"
+```
+
+### Exemplo de Procurement
+
+#### Bash
+
+```bash
+python build_knowledge_base.py search-federated \
+  --graph-dir "./data/graph/procurement_common" \
+  --query "acordo de compra valor liberado fornecedor condições de pagamento" \
+  --module "procurement" \
+  --limit 20 \
+  --max-characters 14000 \
+  > "./resultado_federado_procurement.json"
+```
+
+#### PowerShell
+
+```powershell
+& ".\.venv\Scripts\python.exe" build_knowledge_base.py search-federated `
+  --graph-dir ".\data\graph\procurement_common" `
+  --query "acordo de compra valor liberado fornecedor condições de pagamento" `
+  --module "procurement" `
+  --limit 20 `
+  --max-characters 14000 |
+  Out-File `
+    -FilePath ".\resultado_federado_procurement.json" `
+    -Encoding utf8
+```
+
+### Exemplo de SCM
+
+#### Bash
+
+```bash
+python build_knowledge_base.py search-federated \
+  --graph-dir "./data/graph/scm" \
+  --query "quais tabelas e colunas representam itens por organização e o número do item" \
+  --module "scm" \
+  --limit 20 \
+  --max-characters 14000 \
+  > "./resultado_scm_itens.json"
+```
+
+#### PowerShell
+
+```powershell
+& ".\.venv\Scripts\python.exe" build_knowledge_base.py search-federated `
+  --graph-dir ".\data\graph\scm" `
+  --query "quais tabelas e colunas representam itens por organização e o número do item" `
+  --module "scm" `
+  --limit 20 `
+  --max-characters 14000 |
+  Out-File `
+    -FilePath ".\resultado_scm_itens.json" `
+    -Encoding utf8
+```
+
+O arquivo JSON salvo contém o contexto e as evidências usadas.
+
+---
+
+## 9. Como interpretar o resultado
+
+O resultado possui cinco partes principais.
+
+### `query`
+
+Pergunta enviada.
+
+### `context`
+
+Texto pronto para análise ou uso em uma conversa com IA.
+
+### `results`
+
+Lista das evidências escolhidas.
+
+Cada resultado pode informar:
+
+- título;
+- tipo;
+- score;
+- resumo;
+- fonte;
+- módulo;
+- evidência estruturada;
+- link para documentação oficial.
+
+### `characters`
+
+Tamanho real do contexto. Ele deve respeitar o limite definido em:
+
+```text
+--max-characters
+```
+
+### `routing`
+
+Mostra como o orquestrador chegou ao resultado.
+
+Campos importantes:
+
+- `master_business_seeds`: conceitos de negócio reconhecidos;
+- `master_routes`: pontes explícitas usadas;
+- `semantic_fallback_roots`: entradas escolhidas por similaridade quando não existia curadoria;
+- `candidate_count`: quantidade de candidatos analisados antes do corte final.
+
+---
+
+## 10. Como avaliar a qualidade do roteamento
+
+### Resultado mais confiável
+
+O bloco `routing` mostra:
+
+- uma entidade ou atributo reconhecido;
+- uma ponte explícita;
+- uma tabela, coluna, subject area ou recurso coerente.
+
+Exemplo conceitual:
+
+```text
+Payment Terms
+→ PO_HEADERS_ALL.TERMS_ID
+```
+
+### Resultado que precisa de mais revisão
+
+O bloco contém apenas:
+
+```text
+semantic_fallback_roots
+```
+
+Isso não significa que o resultado esteja errado. Significa que o módulo ainda não possuía uma ponte curada e a ferramenta escolheu pontos de entrada por semelhança semântica.
+
+Nesse caso:
+
+1. revise as evidências;
+2. valide a resposta;
+3. registre o conhecimento confirmado;
+4. gere os grafos novamente.
+
+---
+
+## 11. Confiança das informações
+
+### Alta confiança
+
+- regra validada no ambiente;
+- relacionamento documentado;
+- chave documentada;
+- descrição oficial;
+- mapeamento explícito de entidade ou atributo.
+
+### Média confiança
+
+- inferência apoiada por nome e descrição;
+- associação semântica dentro de uma camada;
+- referência incompleta ou tabela stub.
+
+### Baixa confiança
+
+- semelhança textual isolada;
+- ausência de mapeamento;
+- conclusão não confirmada;
+- código de status sem lookup ou documentação.
+
+A resposta final deve diferenciar fatos documentados de inferências.
+
+---
+
+## 12. Contexto não é resposta final
+
+Quando o sistema retorna um contexto, ele está dizendo:
+
+> Estas são as evidências selecionadas para responder à pergunta.
+
+Ele ainda não está:
+
+- executando a consulta;
+- validando o resultado com dados reais;
+- confirmando uma regra funcional;
+- garantindo que não existam customizações.
+
+O contexto deve ser usado para apoiar a próxima etapa.
+
+---
+
+## 13. Usar o contexto com uma IA
+
+Depois de executar a busca, abra o JSON e copie o campo `context`.
+
+Exemplo de solicitação:
+
+```text
+Atue como especialista em Oracle Fusion Cloud Applications.
+
+Com base somente no contexto abaixo:
+1. identifique as fontes candidatas;
+2. diferencie documentação oficial, regra validada e inferência;
+3. proponha joins apenas quando houver evidência;
+4. alerte sobre granularidade e duplicidade;
+5. não invente colunas;
+6. gere a SQL somente depois de explicar as incertezas.
+
+[cole aqui o conteúdo de context]
+```
+
+Isso reduz o risco de a IA inventar tabela, coluna, join ou regra.
+
+---
+
+## 14. Cuidados ao interpretar tabelas e colunas
+
+### `OBJECT_VERSION_NUMBER`
+
+Normalmente representa controle técnico de concorrência. Não deve ser usado automaticamente como versão de negócio.
+
+### Chave primária
+
+Indica unicidade física, mas não necessariamente o grão desejado no dataset.
+
+### Campos de status
+
+O nome do campo não explica sozinho o significado dos códigos.
+
+### Flags
+
+Nem toda coluna terminada em `_FLAG` usa somente `Y` e `N`.
+
+### Datas
+
+É necessário distinguir:
+
+- criação;
+- atualização;
+- aprovação;
+- vigência;
+- processamento;
+- data contábil;
+- data do documento.
+
+### Valores monetários
+
+Valide:
+
+- moeda;
+- nível de cabeçalho ou linha;
+- valor original;
+- valor liberado;
+- valor comprometido;
+- conversão cambial.
+
+---
+
+## 15. Registrar uma regra validada
+
+Quando uma análise for confirmada, registre:
+
+- pergunta;
+- módulo;
+- entidade;
+- tabelas;
+- colunas;
+- joins;
+- filtros;
+- grão;
+- ranking;
+- SQL validada;
+- ambiente;
+- responsável;
+- data da validação.
+
+O arquivo por módulo fica em:
+
+```text
+data/modules/<module_id>/rules/validated_rules.json
+```
+
+Depois da alteração, gere novamente os grafos.
 
 Exemplo:
 
-```text
-ORDER BY VERSION_NUMBER DESC, LAST_UPDATE_DATE DESC
+#### Bash
+
+```bash
+python build_knowledge_base.py link \
+  --modules-root "./data/modules" \
+  --include-default-curation \
+  --output-dir "./data/graph/fusion_modules"
+```
+
+#### PowerShell
+
+```powershell
+& ".\.venv\Scripts\python.exe" build_knowledge_base.py link `
+  --modules-root ".\data\modules" `
+  --include-default-curation `
+  --output-dir ".\data\graph\fusion_modules"
 ```
 
 ---
 
-## 17. Fluxo recomendado para o usuário de negócio
+## 16. Registrar aliases e mapeamentos
 
-1. Defina a pergunta de negócio.
-2. Informe o módulo, se souber.
-3. Execute ou solicite a busca na ferramenta.
-4. Revise as tabelas, regras e alertas retornados.
-5. Peça geração de SQL ou explicação usando o contexto.
-6. Valide a regra com dados reais.
-7. Se a regra estiver correta, peça para cadastrá-la como regra validada.
+Aliases ligam a linguagem do usuário aos objetos técnicos.
 
----
-
-## 18. Exemplo completo
-
-### Pergunta
+Exemplos:
 
 ```text
-quais projetos estão sem orçamento aprovado
+acordo de compra
+purchase agreement
+blanket agreement
 ```
-
-### O que a ferramenta deve ajudar a encontrar
-
-- tabela de projetos;
-- tabela de versões de plano financeiro;
-- regra para orçamento aprovado;
-- relacionamento por `PROJECT_ID`;
-- estratégia para identificar ausência.
-
-### Contexto esperado
 
 ```text
-Projetos:
-- PJF_PROJECTS_ALL_B ou view equivalente
-
-Versões de plano:
-- PJO_PLAN_VERSIONS_VL
-
-Regra de orçamento aprovado:
-- PLAN_CLASS_CODE = 'BUDGET'
-- PLAN_STATUS_CODE = 'B'
-- CURRENT_PLAN_STATUS_FLAG = 'Y'
-- PROCESSING_TIME IS NOT NULL
-
-Estratégia:
-- selecionar projetos
-- usar NOT EXISTS contra versões de orçamento aprovadas
+valor liberado
+released amount
+amount released
 ```
 
-### Uso posterior
+O arquivo por módulo fica em:
 
-Com esse contexto, uma IA ou analista pode montar uma SQL mais segura.
+```text
+data/modules/<module_id>/config/entity_aliases.json
+```
 
----
-
-## 19. Como reportar melhoria da base
-
-Sempre que uma análise for concluída, registre:
-
-- pergunta original;
-- módulo;
-- tabelas usadas;
-- joins usados;
-- filtros validados;
-- regra de ranking;
-- SQL final;
-- validação realizada;
-- data da validação;
-- responsável pela validação.
-
-Isso transforma conhecimento pontual em conhecimento reutilizável.
+Um alias não deve criar centenas de relações por simples ocorrência textual. Ele deve apontar para uma entidade ou atributo e, quando conhecido, para objetos técnicos específicos.
 
 ---
 
-## 20. Resumo final
+## 17. Coletar ou atualizar um módulo
 
-A ferramenta serve para acelerar entendimento do Oracle Fusion Cloud Applications.
+Essa atividade normalmente é técnica, mas pode ser acompanhada pelo responsável funcional.
 
-Ela ajuda a encontrar caminhos, tabelas, regras e evidências.
+### Coleta de SCM
 
-Ela não substitui validação funcional nem execução no banco.
+#### Bash
 
-O melhor uso é:
+```bash
+python -u build_knowledge_base.py collect-module \
+  --module-url "https://docs.oracle.com/en/cloud/saas/supply-chain-and-manufacturing/26b/oedsc/index.html" \
+  --module-id "scm" \
+  --module-name "Supply Chain Management" \
+  --release "26B" \
+  --output-dir "./data/modules/scm" \
+  --otbi-url "https://docs.oracle.com/en/cloud/saas/supply-chain-and-manufacturing/26b/faosm/toc.htm" \
+  --rest-url "https://docs.oracle.com/en/cloud/saas/supply-chain-and-manufacturing/26b/fasrp/toc.htm" \
+  --delay-seconds 0.15 \
+  2>&1 | tee "./coleta_scm.log"
+```
+
+#### PowerShell
+
+```powershell
+& ".\.venv\Scripts\python.exe" -u build_knowledge_base.py collect-module `
+  --module-url "https://docs.oracle.com/en/cloud/saas/supply-chain-and-manufacturing/26b/oedsc/index.html" `
+  --module-id "scm" `
+  --module-name "Supply Chain Management" `
+  --release "26B" `
+  --output-dir ".\data\modules\scm" `
+  --otbi-url "https://docs.oracle.com/en/cloud/saas/supply-chain-and-manufacturing/26b/faosm/toc.htm" `
+  --rest-url "https://docs.oracle.com/en/cloud/saas/supply-chain-and-manufacturing/26b/fasrp/toc.htm" `
+  --delay-seconds 0.15 `
+  2>&1 |
+  Tee-Object `
+    -FilePath ".\coleta_scm.log"
+```
+
+### Continuar depois de interrupção
+
+Quando o manifesto físico já estiver completo:
+
+#### Bash
+
+```bash
+python -u build_knowledge_base.py collect-module \
+  --module-url "https://docs.oracle.com/en/cloud/saas/supply-chain-and-manufacturing/26b/oedsc/index.html" \
+  --module-id "scm" \
+  --module-name "Supply Chain Management" \
+  --release "26B" \
+  --output-dir "./data/modules/scm" \
+  --skip-physical \
+  --otbi-url "https://docs.oracle.com/en/cloud/saas/supply-chain-and-manufacturing/26b/faosm/toc.htm" \
+  --rest-url "https://docs.oracle.com/en/cloud/saas/supply-chain-and-manufacturing/26b/fasrp/toc.htm" \
+  --delay-seconds 0.15 \
+  2>&1 | tee "./coleta_scm_continuacao.log"
+```
+
+#### PowerShell
+
+```powershell
+& ".\.venv\Scripts\python.exe" -u build_knowledge_base.py collect-module `
+  --module-url "https://docs.oracle.com/en/cloud/saas/supply-chain-and-manufacturing/26b/oedsc/index.html" `
+  --module-id "scm" `
+  --module-name "Supply Chain Management" `
+  --release "26B" `
+  --output-dir ".\data\modules\scm" `
+  --skip-physical `
+  --otbi-url "https://docs.oracle.com/en/cloud/saas/supply-chain-and-manufacturing/26b/faosm/toc.htm" `
+  --rest-url "https://docs.oracle.com/en/cloud/saas/supply-chain-and-manufacturing/26b/fasrp/toc.htm" `
+  --delay-seconds 0.15 `
+  2>&1 |
+  Tee-Object `
+    -FilePath ".\coleta_scm_continuacao.log"
+```
+
+Não apague o diretório do módulo nem o cache durante uma continuação normal.
+
+---
+
+## 18. Gerar os grafos de um módulo
+
+### SCM isolado
+
+#### Bash
+
+```bash
+rm -rf "./data/graph/scm"
+
+python build_knowledge_base.py link \
+  --module-dir "./data/modules/scm" \
+  --output-dir "./data/graph/scm"
+```
+
+#### PowerShell
+
+```powershell
+if (Test-Path ".\data\graph\scm") {
+    Remove-Item `
+      -Path ".\data\graph\scm" `
+      -Recurse `
+      -Force
+}
+
+& ".\.venv\Scripts\python.exe" build_knowledge_base.py link `
+  --module-dir ".\data\modules\scm" `
+  --output-dir ".\data\graph\scm"
+```
+
+### Procurement com Common
+
+#### Bash
+
+```bash
+rm -rf "./data/graph/procurement_common"
+
+python build_knowledge_base.py link \
+  --module-dir "./data/modules/procurement" \
+  --module-dir "./data/modules/common" \
+  --include-default-curation \
+  --output-dir "./data/graph/procurement_common"
+```
+
+#### PowerShell
+
+```powershell
+if (Test-Path ".\data\graph\procurement_common") {
+    Remove-Item `
+      -Path ".\data\graph\procurement_common" `
+      -Recurse `
+      -Force
+}
+
+& ".\.venv\Scripts\python.exe" build_knowledge_base.py link `
+  --module-dir ".\data\modules\procurement" `
+  --module-dir ".\data\modules\common" `
+  --include-default-curation `
+  --output-dir ".\data\graph\procurement_common"
+```
+
+### Todos os módulos
+
+#### Bash
+
+```bash
+rm -rf "./data/graph/fusion_modules"
+
+python build_knowledge_base.py link \
+  --modules-root "./data/modules" \
+  --include-default-curation \
+  --output-dir "./data/graph/fusion_modules"
+```
+
+#### PowerShell
+
+```powershell
+if (Test-Path ".\data\graph\fusion_modules") {
+    Remove-Item `
+      -Path ".\data\graph\fusion_modules" `
+      -Recurse `
+      -Force
+}
+
+& ".\.venv\Scripts\python.exe" build_knowledge_base.py link `
+  --modules-root ".\data\modules" `
+  --include-default-curation `
+  --output-dir ".\data\graph\fusion_modules"
+```
+
+---
+
+## 19. Testar um módulo sem viés de confirmação
+
+Para verificar se a ferramenta não está ajustada somente ao caso usado durante o desenvolvimento:
+
+1. colete um módulo diferente;
+2. gere um bundle isolado;
+3. não inclua curadoria de outro módulo;
+4. faça perguntas de áreas distintas;
+5. analise o `routing`;
+6. compare respostas técnicas, OTBI e REST;
+7. valide se resultados úteis aparecem sem aliases específicos.
+
+Exemplo de conjunto de testes SCM:
+
+#### Bash
+
+```bash
+python build_knowledge_base.py search-federated \
+  --graph-dir "./data/graph/scm" \
+  --query "qual tabela armazena ordens de produção e qual coluna identifica o número da ordem" \
+  --module "scm" \
+  --limit 20 \
+  --max-characters 14000 \
+  > "./resultado_scm_manufacturing.json"
+
+python build_knowledge_base.py search-federated \
+  --graph-dir "./data/graph/scm" \
+  --query "quais tabelas e colunas representam itens por organização e o número do item" \
+  --module "scm" \
+  --limit 20 \
+  --max-characters 14000 \
+  > "./resultado_scm_product_management.json"
+
+python build_knowledge_base.py search-federated \
+  --graph-dir "./data/graph/scm" \
+  --query "qual subject area permite analisar custos estimados e reais por ordem de produção" \
+  --module "scm" \
+  --limit 20 \
+  --max-characters 14000 \
+  > "./resultado_scm_costing_otbi.json"
+
+python build_knowledge_base.py search-federated \
+  --graph-dir "./data/graph/scm" \
+  --query "qual recurso REST permite consultar quantidades disponíveis de itens em estoque por subinventário" \
+  --module "scm" \
+  --limit 20 \
+  --max-characters 14000 \
+  > "./resultado_scm_inventory_rest.json"
+```
+
+#### PowerShell
+
+```powershell
+& ".\.venv\Scripts\python.exe" build_knowledge_base.py search-federated `
+  --graph-dir ".\data\graph\scm" `
+  --query "qual tabela armazena ordens de produção e qual coluna identifica o número da ordem" `
+  --module "scm" `
+  --limit 20 `
+  --max-characters 14000 |
+  Out-File `
+    -FilePath ".\resultado_scm_manufacturing.json" `
+    -Encoding utf8
+
+& ".\.venv\Scripts\python.exe" build_knowledge_base.py search-federated `
+  --graph-dir ".\data\graph\scm" `
+  --query "quais tabelas e colunas representam itens por organização e o número do item" `
+  --module "scm" `
+  --limit 20 `
+  --max-characters 14000 |
+  Out-File `
+    -FilePath ".\resultado_scm_product_management.json" `
+    -Encoding utf8
+
+& ".\.venv\Scripts\python.exe" build_knowledge_base.py search-federated `
+  --graph-dir ".\data\graph\scm" `
+  --query "qual subject area permite analisar custos estimados e reais por ordem de produção" `
+  --module "scm" `
+  --limit 20 `
+  --max-characters 14000 |
+  Out-File `
+    -FilePath ".\resultado_scm_costing_otbi.json" `
+    -Encoding utf8
+
+& ".\.venv\Scripts\python.exe" build_knowledge_base.py search-federated `
+  --graph-dir ".\data\graph\scm" `
+  --query "qual recurso REST permite consultar quantidades disponíveis de itens em estoque por subinventário" `
+  --module "scm" `
+  --limit 20 `
+  --max-characters 14000 |
+  Out-File `
+    -FilePath ".\resultado_scm_inventory_rest.json" `
+    -Encoding utf8
+```
+
+---
+
+## 20. Problemas comuns
+
+### Resultado vazio em busca direta
+
+Uma pergunta em português pode não encontrar um termo técnico em inglês na primeira etapa lexical. Use a busca federada.
+
+### `master_graph.json` vazio
+
+O módulo não possui curadoria. O orquestrador usa fallback semântico. Verifique `semantic_fallback_roots`.
+
+### Resultado tecnicamente parecido, mas funcionalmente inadequado
+
+A similaridade textual não substitui mapeamento. Valide a função da tabela, coluna ou subject area.
+
+### Contexto muito grande
+
+Reduza:
+
+```text
+--limit
+```
+
+ou:
+
+```text
+--max-characters
+```
+
+### Caracteres corrompidos
+
+Configure UTF-8 e salve com:
+
+#### Bash
+
+```bash
+> arquivo.json
+```
+
+#### PowerShell
+
+```powershell
+Out-File -Encoding utf8
+```
+
+### Fonte ausente
+
+Verifique se o arquivo correspondente existe:
+
+```text
+physical/manifest.json
+functional/fragments.jsonl
+otbi/catalog.json
+rest/catalog.json
+```
+
+---
+
+## 21. Glossário
+
+### Entidade de negócio
+
+Objeto reconhecido pelo usuário, como projeto, orçamento, fornecedor, acordo ou ordem de produção.
+
+### Atributo de negócio
+
+Informação associada à entidade, como valor liberado, status ou condição de pagamento.
+
+### Grafo mestre
+
+Mapa compacto que liga conceitos de negócio aos principais pontos dos grafos especializados.
+
+### Ponte explícita
+
+Relacionamento cadastrado ou documentado entre dois objetos.
+
+### Fallback semântico
+
+Ponto de entrada escolhido por similaridade quando não existe ponte explícita.
+
+### Tabela stub
+
+Representação de uma tabela referenciada, mas ainda não coletada no catálogo físico.
+
+### Grão
+
+Nível de detalhe do resultado, como uma linha por acordo, projeto, item ou ordem.
+
+### OTBI
+
+Camada analítica do Oracle Fusion organizada em subject areas.
+
+### REST
+
+Interface de serviços organizada em recursos e operações.
+
+### Regra validada
+
+Conhecimento confirmado pela equipe e registrado para reutilização.
+
+---
+
+## 22. Fluxo recomendado
 
 ```text
 pergunta de negócio
-    ↓
-busca de contexto
-    ↓
-geração de SQL ou explicação
-    ↓
-validação com dados reais
-    ↓
-registro da regra validada
+        ↓
+busca federada
+        ↓
+revisão de context, results e routing
+        ↓
+resposta ou SQL candidata
+        ↓
+validação com documentação e dados reais
+        ↓
+registro de aliases e regras confirmadas
+        ↓
+nova geração dos grafos
 ```
 
-Quanto mais regras validadas forem cadastradas, mais útil e assertiva a ferramenta se torna.
+A ferramenta melhora à medida que o conhecimento validado é registrado, sem transformar simples semelhanças textuais em relações permanentes.

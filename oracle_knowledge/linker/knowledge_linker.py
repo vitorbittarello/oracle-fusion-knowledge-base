@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable
@@ -18,6 +19,12 @@ from oracle_knowledge.common import (
     write_json,
 )
 
+from oracle_knowledge.linker.graph_layers import (
+    build_graph_bundle_from_graph,
+    normalize_graph_node,
+    write_graph_bundle,
+)
+
 EDGE_WEIGHTS = {
     "contains_column": 1.0,
     "foreign_key_to": 1.0,
@@ -32,6 +39,13 @@ EDGE_WEIGHTS = {
     "mentions_entity": 0.7,
     "related_by_alias": 0.75,
 }
+
+DOCUMENTED_REFERENCE_RE = re.compile(
+    r"\bREFERENCES?(?:\s+TO)?\s+"
+    r"([A-Z][A-Z0-9_$#]*_[A-Z0-9_$#]+)"
+    r"\.([A-Z][A-Z0-9_$#]*)\b",
+    re.IGNORECASE,
+)
 
 
 def _path_list(value: str | Path | Iterable[str | Path] | None) -> list[str]:
@@ -151,6 +165,52 @@ class GraphBuilder:
             "evidence": evidence or {},
         }
 
+    def _ensure_physical_table_stub(
+        self,
+        table_name: str,
+        *,
+        source_node_id: str | None = None,
+        evidence: dict[str, Any] | None = None,
+    ) -> str | None:
+        normalized_name = str(table_name or "").upper()
+        if not normalized_name:
+            return None
+
+        existing = self.table_by_name.get(normalized_name)
+        if existing:
+            return existing
+
+        source_node = self.nodes.get(source_node_id or "", {})
+        source = dict(source_node.get("source") or {})
+        source["source_type"] = "oracle_data_dictionary_reference"
+        source["referenced_from"] = source_node.get("name")
+
+        table_id = stable_id("table", normalized_name)
+        self.add_node(
+            {
+                "id": table_id,
+                "node_type": "physical_table_stub",
+                "name": normalized_name,
+                "title": normalized_name,
+                "description": (
+                    "Tabela referenciada pela documentação física, "
+                    "mas não presente nos manifests carregados."
+                ),
+                "module_id": source_node.get("module_id"),
+                "module_name": source_node.get("module_name"),
+                "source": source,
+                "confidence": "medium",
+                "reference_evidence": evidence or {},
+                "search_text": merge_text_fields(
+                    normalized_name,
+                    "referenced table",
+                    source_node.get("name"),
+                ),
+            }
+        )
+        self.table_by_name[normalized_name] = table_id
+        return table_id
+
     def load_physical_manifest(self, path: str | None) -> None:
         if not path:
             return
@@ -259,6 +319,50 @@ class GraphBuilder:
                     self.column_by_qualified_name[qualified_name] = column_id
                     self.add_edge(table_id, column_id, "contains_column")
 
+                    structured_references: list[dict[str, Any]] = []
+                    for semantic in semantics:
+                        if not isinstance(semantic, dict):
+                            continue
+                        for reference in semantic.get("references") or []:
+                            if not isinstance(reference, dict):
+                                continue
+                            target_table = reference.get("table")
+                            if not target_table:
+                                continue
+                            structured_references.append(reference)
+                            self.pending_relationships.append(
+                                (
+                                    table_name,
+                                    {
+                                        "source_table": table_name,
+                                        "source_column": column_name,
+                                        "target_table": str(target_table).upper(),
+                                        "target_column": (
+                                            str(reference.get("column")).upper()
+                                            if reference.get("column")
+                                            else None
+                                        ),
+                                        "source": "column_semantics",
+                                    },
+                                )
+                            )
+
+                    if not structured_references:
+                        description = str(column_metadata.get("description") or "")
+                        for match in DOCUMENTED_REFERENCE_RE.finditer(description):
+                            self.pending_relationships.append(
+                                (
+                                    table_name,
+                                    {
+                                        "source_table": table_name,
+                                        "source_column": column_name,
+                                        "target_table": match.group(1).upper(),
+                                        "target_column": match.group(2).upper(),
+                                        "source": "column_description",
+                                    },
+                                )
+                            )
+
                 for relation in component.get("relationships", {}).get("outgoing", []):
                     self.pending_relationships.append((table_name, dict(relation)))
 
@@ -266,13 +370,23 @@ class GraphBuilder:
         for source_name, relation in self.pending_relationships:
             source_id = self.table_by_name.get(source_name.upper())
             target_name = (relation.get("target_table") or "").upper()
+
+            if not source_id or not target_name:
+                continue
+
             target_id = self.table_by_name.get(target_name)
-            if source_id and target_id:
-                self.add_edge(source_id, target_id, "foreign_key_to", evidence=relation)
+            if not target_id:
+                target_id = self._ensure_physical_table_stub(
+                    target_name,
+                    source_node_id=source_id,
+                    evidence=relation,
+                )
+
+            if target_id:
                 self.add_edge(
-                    target_id,
                     source_id,
-                    "incoming_foreign_key_from",
+                    target_id,
+                    "foreign_key_to",
                     evidence=relation,
                 )
 
@@ -636,7 +750,6 @@ class GraphBuilder:
                         },
                     )
 
-        self._link_entities_by_alias()
 
     def _link_entities_by_alias(self) -> None:
         for entity_key, entity_node_id in self.entity_by_id.items():
@@ -666,32 +779,64 @@ class GraphBuilder:
                     )
 
     def build(self) -> dict[str, Any]:
-        nodes = list(self.nodes.values())
-        edges = list(self.edges.values())
+        normalized_nodes: list[dict[str, Any]] = []
+        valid_ids: set[str] = set()
+
+        for node in self.nodes.values():
+            normalized = normalize_graph_node(node)
+            if normalized is None:
+                continue
+            normalized_nodes.append(normalized)
+            valid_ids.add(normalized["id"])
+
+        edges = [
+            edge
+            for edge in self.edges.values()
+            if (
+                edge.get("type") not in {
+                    "mentions_entity",
+                    "related_by_alias",
+                    "incoming_foreign_key_from",
+                }
+                and edge.get("source") in valid_ids
+                and edge.get("target") in valid_ids
+            )
+        ]
+
         type_counts: dict[str, int] = defaultdict(int)
         edge_counts: dict[str, int] = defaultdict(int)
         module_counts: dict[str, int] = defaultdict(int)
-        for node in nodes:
+        layer_counts: dict[str, int] = defaultdict(int)
+
+        for node in normalized_nodes:
             type_counts[node.get("node_type", "unknown")] += 1
+            layer_counts[node.get("graph_layer", "unknown")] += 1
             for module_id in node.get("modules", []):
                 module_counts[module_id] += 1
+
         for edge in edges:
             edge_counts[edge["type"]] += 1
+
         return {
-            "version": "2.0.0",
+            "version": "3.0.0",
             "generated_at": utc_now_iso(),
+            "graph_layer": "combined",
             "sources": self.loaded_sources,
-            "nodes": nodes,
+            "nodes": normalized_nodes,
             "edges": edges,
             "stats": {
-                "nodes": len(nodes),
+                "nodes": len(normalized_nodes),
                 "edges": len(edges),
                 "nodes_by_type": dict(sorted(type_counts.items())),
                 "edges_by_type": dict(sorted(edge_counts.items())),
                 "nodes_by_module": dict(sorted(module_counts.items())),
+                "nodes_by_layer": dict(sorted(layer_counts.items())),
                 "source_files": len(self.loaded_sources),
             },
         }
+
+    def build_bundle(self) -> dict[str, dict[str, Any]]:
+        return build_graph_bundle_from_graph(self.build())
 
 
 def build_graph(
@@ -720,6 +865,32 @@ def build_graph(
     return builder.build()
 
 
+def build_graph_bundle(
+    *,
+    physical_manifest: str | Path | Iterable[str | Path] | None = None,
+    functional_fragments: str | Path | Iterable[str | Path] | None = None,
+    otbi_catalog: str | Path | Iterable[str | Path] | None = None,
+    rest_catalog: str | Path | Iterable[str | Path] | None = None,
+    validated_rules: str | Path | Iterable[str | Path] | None = None,
+    entity_aliases: str | Path | Iterable[str | Path] | None = None,
+) -> dict[str, dict[str, Any]]:
+    builder = GraphBuilder()
+    for path in _path_list(physical_manifest):
+        builder.load_physical_manifest(path)
+    builder.resolve_physical_relationships()
+    for path in _path_list(functional_fragments):
+        builder.load_functional(path)
+    for path in _path_list(otbi_catalog):
+        builder.load_otbi(path)
+    for path in _path_list(rest_catalog):
+        builder.load_rest(path)
+    for path in _path_list(validated_rules):
+        builder.load_rules(path)
+    for path in _path_list(entity_aliases):
+        builder.load_entities(path)
+    return builder.build_bundle()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Liga múltiplos módulos em um único grafo de conhecimento."
@@ -730,20 +901,35 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rest-catalog", action="append")
     parser.add_argument("--validated-rules", action="append")
     parser.add_argument("--entity-aliases", action="append")
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--output")
+    parser.add_argument("--output-dir")
     return parser
 
 
 def main() -> None:
     args = build_parser().parse_args()
-    graph = build_graph(
-        physical_manifest=args.physical_manifest,
-        functional_fragments=args.functional_fragments,
-        otbi_catalog=args.otbi_catalog,
-        rest_catalog=args.rest_catalog,
-        validated_rules=args.validated_rules,
-        entity_aliases=args.entity_aliases,
-    )
+    if not args.output and not args.output_dir:
+        raise SystemExit("Informe --output ou --output-dir.")
+
+    build_kwargs = {
+        "physical_manifest": args.physical_manifest,
+        "functional_fragments": args.functional_fragments,
+        "otbi_catalog": args.otbi_catalog,
+        "rest_catalog": args.rest_catalog,
+        "validated_rules": args.validated_rules,
+        "entity_aliases": args.entity_aliases,
+    }
+
+    if args.output_dir:
+        bundle = build_graph_bundle(**build_kwargs)
+        outputs = write_graph_bundle(args.output_dir, bundle)
+        print(
+            f"[CONCLUÍDO] {len(bundle)} grafos gravados em "
+            f"{args.output_dir}: {', '.join(sorted(outputs))}."
+        )
+        return
+
+    graph = build_graph(**build_kwargs)
     write_json(args.output, graph)
     print(
         f"[CONCLUÍDO] {graph['stats']['nodes']} nós, "

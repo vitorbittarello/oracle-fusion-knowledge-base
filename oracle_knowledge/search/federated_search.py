@@ -1,0 +1,401 @@
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+from oracle_knowledge.common import read_json
+from oracle_knowledge.search.hybrid_search import HybridSearch, SearchConfig
+from oracle_knowledge.search.semantic_context import SemanticTextSelector
+
+
+@dataclass(frozen=True)
+class FederatedSearchConfig:
+    master_search_limit: int = 40
+    master_seed_limit: int = 12
+    master_seed_min_relative_score: float = 0.10
+    fallback_roots_per_layer: int = 3
+    local_columns_per_table: int = 5
+    local_questions_per_subject_area: int = 2
+    local_operations_per_resource: int = 3
+
+
+class FederatedGraphSearch:
+    """Orquestra a navegação entre master e grafos especializados."""
+
+    def __init__(
+        self,
+        graph_dir: str | Path,
+        *,
+        config: FederatedSearchConfig | None = None,
+        semantic_text_selector: SemanticTextSelector | None = None,
+    ) -> None:
+        self.graph_dir = Path(graph_dir)
+        self.config = config or FederatedSearchConfig()
+        self.semantic_text_selector = semantic_text_selector or SemanticTextSelector()
+        self.master_graph = read_json(self.graph_dir / "master_graph.json", {})
+        if not self.master_graph or "nodes" not in self.master_graph:
+            raise ValueError(f"master_graph.json inválido em {self.graph_dir}")
+        self.master_search = HybridSearch(
+            self.master_graph,
+            SearchConfig(graph_hops=0),
+            semantic_text_selector=self.semantic_text_selector,
+        )
+        self._graphs: dict[str, dict[str, Any]] = {"master": self.master_graph}
+        self._searches: dict[str, HybridSearch] = {"master": self.master_search}
+
+    def _layer_path(self, layer: str) -> Path:
+        filename = (self.master_graph.get("layers") or {}).get(layer)
+        if not filename:
+            filename = {
+                "physical": "physical.json",
+                "otbi_analytics": "otbi_analytics.json",
+                "rest": "rest.json",
+                "business": "business.json",
+            }[layer]
+        return self.graph_dir / filename
+
+    def _load_layer(self, layer: str) -> dict[str, Any]:
+        if layer not in self._graphs:
+            graph = read_json(self._layer_path(layer), {})
+            self._graphs[layer] = graph
+            self._searches[layer] = HybridSearch(
+                graph,
+                SearchConfig(graph_hops=0),
+                semantic_text_selector=self.semantic_text_selector,
+            )
+        return self._graphs[layer]
+
+    @staticmethod
+    def _node_text(node: dict[str, Any]) -> str:
+        return "\n".join(
+            value
+            for value in (
+                str(node.get("title") or node.get("name") or "").strip(),
+                str(node.get("qualified_name") or "").strip(),
+                str(node.get("search_text") or "").strip(),
+                HybridSearch._context_summary_source(node),
+            )
+            if value
+        )
+
+    def _semantic_top(
+        self,
+        query: str,
+        nodes: list[dict[str, Any]],
+        limit: int,
+    ) -> list[tuple[dict[str, Any], float]]:
+        if not nodes or limit <= 0:
+            return []
+        scores = self.semantic_text_selector.score_documents(
+            query,
+            [self._node_text(node) for node in nodes],
+        )
+        ranked = sorted(
+            zip(nodes, scores),
+            key=lambda item: (-float(item[1]), str(item[0].get("title") or "")),
+        )
+        return [(node, float(score)) for node, score in ranked[:limit]]
+
+    @staticmethod
+    def _matches_modules(node: dict[str, Any], module_ids: set[str] | None) -> bool:
+        return not module_ids or bool(module_ids.intersection(set(node.get("modules") or [])))
+
+    def _master_routes(
+        self,
+        query: str,
+        module_ids: set[str] | None,
+    ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], list[dict[str, Any]]]:
+        results = self.master_search.search(
+            query,
+            limit=self.config.master_search_limit,
+            module_ids=module_ids,
+            graph_hops=0,
+        )
+        business = [
+            row for row in results
+            if row.get("node_type") in {"business_entity", "business_attribute", "validated_rule"}
+            and float(row.get("direct_score") or 0.0) > 0.0
+        ]
+        if business:
+            best = max(float(row.get("direct_score") or 0.0) for row in business)
+            floor = best * self.config.master_seed_min_relative_score
+            business = [
+                row for row in business
+                if float(row.get("direct_score") or 0.0) >= floor
+            ][: self.config.master_seed_limit]
+
+        master_nodes = {node["id"]: node for node in self.master_graph.get("nodes", [])}
+        outgoing: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        incoming: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for edge in self.master_graph.get("edges", []):
+            outgoing[edge["source"]].append(edge)
+            incoming[edge["target"]].append(edge)
+
+        routed: dict[str, dict[str, Any]] = {}
+        diagnostics: list[dict[str, Any]] = []
+        diagnostic_keys: set[tuple[str, str, str | None]] = set()
+
+        def add_route(node_id: str, score: float, reason: str, source_id: str | None = None) -> None:
+            node = master_nodes.get(node_id)
+            if not node:
+                return
+            current = routed.get(node_id)
+            if current is None or score > current["score"]:
+                routed[node_id] = {"node": node, "score": score, "reason": reason}
+            diagnostic_key = (node_id, reason, source_id)
+            if diagnostic_key not in diagnostic_keys:
+                diagnostic_keys.add(diagnostic_key)
+                diagnostics.append({"node_id": node_id, "title": node.get("title"), "reason": reason, "source_id": source_id})
+
+        for rank, row in enumerate(business, start=1):
+            seed_score = 1.0 / rank
+            add_route(row["id"], 1.0 + seed_score, "master_business_seed")
+            node_type = row.get("node_type")
+            parent_entities: list[str] = []
+            if node_type == "business_attribute":
+                for edge in incoming.get(row["id"], []):
+                    if edge.get("type") == "has_attribute":
+                        parent_entities.append(edge["source"])
+                        add_route(edge["source"], 0.95 + seed_score, "attribute_parent_entity", row["id"])
+                bridge_types = {"mapped_to_attribute", "uses_column"}
+            elif node_type == "business_entity":
+                parent_entities.append(row["id"])
+                bridge_types = {"mapped_to_entity", "uses_table", "uses_column"}
+            else:
+                bridge_types = {"uses_table", "uses_column"}
+
+            for edge in outgoing.get(row["id"], []):
+                if edge.get("type") in bridge_types:
+                    add_route(edge["target"], 0.90 + seed_score, edge["type"], row["id"])
+
+            for entity_id in parent_entities:
+                for edge in outgoing.get(entity_id, []):
+                    if edge.get("type") in {"mapped_to_entity", "uses_table", "uses_column"}:
+                        add_route(edge["target"], 0.85 + seed_score, edge["type"], entity_id)
+
+        return business, routed, diagnostics
+
+    def _fallback_roots(
+        self,
+        query: str,
+        layer: str,
+        module_ids: set[str] | None,
+    ) -> list[tuple[dict[str, Any], float]]:
+        graph = self._load_layer(layer)
+        root_types = {
+            "physical": {"physical_table"},
+            "otbi_analytics": {"otbi_subject_area"},
+            "rest": {"rest_resource"},
+        }[layer]
+        nodes = [
+            node for node in graph.get("nodes", [])
+            if node.get("node_type") in root_types and self._matches_modules(node, module_ids)
+        ]
+        return self._semantic_top(query, nodes, self.config.fallback_roots_per_layer)
+
+    def _expand_physical(
+        self,
+        query: str,
+        seed_ids: set[str],
+        module_ids: set[str] | None,
+    ) -> list[tuple[dict[str, Any], float, str]]:
+        graph = self._load_layer("physical")
+        nodes = {node["id"]: node for node in graph.get("nodes", [])}
+        outgoing: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        incoming: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for edge in graph.get("edges", []):
+            outgoing[edge["source"]].append(edge)
+            incoming[edge["target"]].append(edge)
+
+        selected: dict[str, tuple[dict[str, Any], float, str]] = {}
+        table_ids: set[str] = set()
+        routed_columns: list[dict[str, Any]] = []
+
+        def add(node: dict[str, Any], score: float, reason: str) -> None:
+            if not self._matches_modules(node, module_ids):
+                return
+            current = selected.get(node["id"])
+            if current is None or score > current[1]:
+                selected[node["id"]] = (node, score, reason)
+
+        for seed_id in seed_ids:
+            node = nodes.get(seed_id)
+            if not node:
+                continue
+            add(node, 0.95, "master_bridge")
+            if node.get("node_type") in {"physical_table", "physical_table_stub"}:
+                table_ids.add(seed_id)
+            elif node.get("node_type") == "physical_column":
+                routed_columns.append(node)
+                for edge in incoming.get(seed_id, []):
+                    if edge.get("type") == "contains_column":
+                        table_ids.add(edge["source"])
+                        parent = nodes.get(edge["source"])
+                        if parent:
+                            add(parent, 0.90, "column_parent_table")
+
+        explicit_tables_with_columns = {
+            str(column.get("table_name") or "").upper()
+            for column in routed_columns
+            if column.get("table_name")
+        }
+
+        for table_id in list(table_ids):
+            table = nodes.get(table_id)
+            if not table:
+                continue
+            table_name = str(table.get("name") or table.get("title") or "").upper()
+            if table_name in explicit_tables_with_columns:
+                continue
+            columns = [
+                nodes[edge["target"]]
+                for edge in outgoing.get(table_id, [])
+                if edge.get("type") == "contains_column" and edge.get("target") in nodes
+            ]
+            for column, score in self._semantic_top(query, columns, self.config.local_columns_per_table):
+                add(column, 0.70 + score * 0.20, "semantic_table_column")
+                routed_columns.append(column)
+
+        for column in routed_columns:
+            table_name = str(column.get("table_name") or "").upper()
+            column_name = str(column.get("name") or "").upper()
+            parent_id = next((tid for tid in table_ids if str(nodes.get(tid, {}).get("name") or "").upper() == table_name), None)
+            if not parent_id:
+                continue
+            for edge in outgoing.get(parent_id, []):
+                evidence = edge.get("evidence") or {}
+                if edge.get("type") != "foreign_key_to":
+                    continue
+                if str(evidence.get("source_column") or "").upper() != column_name:
+                    continue
+                target = nodes.get(edge["target"])
+                if target:
+                    add(target, 0.82, "column_foreign_key")
+
+        return list(selected.values())
+
+    def _expand_otbi(self, query: str, seed_ids: set[str], module_ids: set[str] | None) -> list[tuple[dict[str, Any], float, str]]:
+        graph = self._load_layer("otbi_analytics")
+        nodes = {node["id"]: node for node in graph.get("nodes", [])}
+        incoming: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for edge in graph.get("edges", []):
+            incoming[edge["target"]].append(edge)
+        selected: list[tuple[dict[str, Any], float, str]] = []
+        for seed_id in seed_ids:
+            node = nodes.get(seed_id)
+            if not node or not self._matches_modules(node, module_ids):
+                continue
+            selected.append((node, 0.95, "master_bridge"))
+            questions = [
+                nodes[edge["source"]]
+                for edge in incoming.get(seed_id, [])
+                if edge.get("type") == "answered_by" and edge.get("source") in nodes
+            ]
+            for question, score in self._semantic_top(query, questions, self.config.local_questions_per_subject_area):
+                selected.append((question, 0.65 + score * 0.20, "subject_area_question"))
+        return selected
+
+    def _expand_rest(self, query: str, seed_ids: set[str], module_ids: set[str] | None) -> list[tuple[dict[str, Any], float, str]]:
+        graph = self._load_layer("rest")
+        nodes = {node["id"]: node for node in graph.get("nodes", [])}
+        outgoing: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for edge in graph.get("edges", []):
+            outgoing[edge["source"]].append(edge)
+        selected: list[tuple[dict[str, Any], float, str]] = []
+        for seed_id in seed_ids:
+            node = nodes.get(seed_id)
+            if not node or not self._matches_modules(node, module_ids):
+                continue
+            selected.append((node, 0.95, "master_bridge"))
+            operations = [
+                nodes[edge["target"]]
+                for edge in outgoing.get(seed_id, [])
+                if edge.get("type") == "has_operation" and edge.get("target") in nodes
+            ]
+            for operation, score in self._semantic_top(query, operations, self.config.local_operations_per_resource):
+                selected.append((operation, 0.65 + score * 0.20, "resource_operation"))
+        return selected
+
+    @staticmethod
+    def _result(node: dict[str, Any], score: float, rank: int) -> dict[str, Any]:
+        return {
+            "id": node["id"],
+            "node_type": node.get("node_type"),
+            "title": node.get("title") or node.get("name") or node["id"],
+            "score": round(float(score), 6),
+            "search_rank": rank,
+            "semantic_score": None,
+            "context_score": round(float(score), 6),
+            "summary": HybridSearch._summary(node),
+            "source": node.get("source", {}),
+            "sources": node.get("sources", []),
+            "modules": node.get("modules", []),
+            "node": node,
+        }
+
+    def build_prompt_context(
+        self,
+        query: str,
+        *,
+        limit: int = 20,
+        max_characters: int = 14000,
+        module_ids: set[str] | None = None,
+    ) -> dict[str, Any]:
+        business, routed, diagnostics = self._master_routes(query, module_ids)
+        candidates: dict[str, tuple[dict[str, Any], float, str, int]] = {}
+
+        def add(node: dict[str, Any], score: float, reason: str, priority: int) -> None:
+            current = candidates.get(node["id"])
+            if (
+                current is None
+                or priority < current[3]
+                or (priority == current[3] and score > current[1])
+            ):
+                candidates[node["id"]] = (node, score, reason, priority)
+
+        for row in business:
+            add(row["node"], 1.10 + float(row.get("direct_score") or 0.0), "master_business_seed", 0)
+        for item in routed.values():
+            add(item["node"], item["score"], item["reason"], 1)
+
+        layer_seed_ids: dict[str, set[str]] = defaultdict(set)
+        for node_id, item in routed.items():
+            layer = item["node"].get("graph_layer")
+            if layer in {"physical", "otbi_analytics", "rest"}:
+                layer_seed_ids[layer].add(node_id)
+
+        fallback: list[dict[str, Any]] = []
+        for layer in ("physical", "otbi_analytics", "rest"):
+            if not layer_seed_ids[layer]:
+                for node, semantic_score in self._fallback_roots(query, layer, module_ids):
+                    layer_seed_ids[layer].add(node["id"])
+                    fallback.append({"layer": layer, "node_id": node["id"], "title": node.get("title"), "semantic_score": round(semantic_score, 6)})
+                    add(node, 0.70 + semantic_score * 0.20, "semantic_layer_root", 2)
+
+        for node, score, reason in self._expand_physical(query, layer_seed_ids["physical"], module_ids):
+            add(node, score, reason, 2 if reason == "master_bridge" else 3)
+        for node, score, reason in self._expand_otbi(query, layer_seed_ids["otbi_analytics"], module_ids):
+            add(node, score, reason, 2 if reason == "master_bridge" else 3)
+        for node, score, reason in self._expand_rest(query, layer_seed_ids["rest"], module_ids):
+            add(node, score, reason, 2 if reason == "master_bridge" else 3)
+
+        ordered = sorted(
+            candidates.values(),
+            key=lambda item: (item[3], -item[1], str(item[0].get("title") or "")),
+        )
+        results = [self._result(node, score, rank) for rank, (node, score, _, _) in enumerate(ordered, start=1)]
+        payload = self.master_search.build_prompt_context_from_results(
+            query,
+            results,
+            limit=limit,
+            max_characters=max_characters,
+        )
+        payload["routing"] = {
+            "master_business_seeds": [row["id"] for row in business],
+            "master_routes": diagnostics,
+            "semantic_fallback_roots": fallback,
+            "candidate_count": len(results),
+        }
+        return payload

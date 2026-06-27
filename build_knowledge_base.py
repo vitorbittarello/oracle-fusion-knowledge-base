@@ -17,8 +17,16 @@ from oracle_knowledge.collectors.functional_docs_collector import FunctionalDocs
 from oracle_knowledge.collectors.otbi_collector import OtbiCollector
 from oracle_knowledge.collectors.rest_collector import RestCollector
 from oracle_knowledge.common import read_json, slugify, utc_now_iso, write_json
-from oracle_knowledge.linker.knowledge_linker import build_graph
+from oracle_knowledge.linker.knowledge_linker import (
+    build_graph,
+    build_graph_bundle,
+)
+from oracle_knowledge.linker.graph_layers import (
+    build_graph_bundle_from_graph,
+    write_graph_bundle,
+)
 from oracle_knowledge.search.hybrid_search import HybridSearch, SearchConfig
+from oracle_knowledge.search.federated_search import FederatedGraphSearch
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_CONFIG = ROOT / "config" / "knowledge_sources.json"
@@ -98,7 +106,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     link = subparsers.add_parser(
         "link",
-        help="Combina um ou vários módulos em um único grafo.",
+        help="Combina módulos em um grafo único ou em grafos separados por camada.",
     )
     link.add_argument(
         "--module-dir",
@@ -125,6 +133,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     link.add_argument("--output", default=str(DEFAULT_GRAPH))
+    link.add_argument(
+        "--output-dir",
+        help=(
+            "Grava business, physical, otbi_analytics, otbi_security, "
+            "rest e master_graph em um diretório. Quando informado, "
+            "não grava o grafo combinado de --output."
+        ),
+    )
+
+    split_graph_parser = subparsers.add_parser(
+        "split-graph",
+        help=(
+            "Migra um grafo combinado existente para grafos separados "
+            "por camada, sem refazer as coletas."
+        ),
+    )
+    split_graph_parser.add_argument("--graph", required=True)
+    split_graph_parser.add_argument("--output-dir", required=True)
 
     all_command = subparsers.add_parser("all")
     add_common_collection_arguments(all_command)
@@ -148,6 +174,24 @@ def build_parser() -> argparse.ArgumentParser:
     search.add_argument("--context", action="store_true")
     search.add_argument("--max-characters", type=int, default=14000)
     search.add_argument(
+        "--module",
+        action="append",
+        default=[],
+        help="Restringe a busca a um module_id. Pode ser repetido.",
+    )
+
+    federated = subparsers.add_parser(
+        "search-federated",
+        help=(
+            "Resolve a consulta no master_graph e navega nos grafos "
+            "physical, otbi_analytics e rest."
+        ),
+    )
+    federated.add_argument("--graph-dir", required=True)
+    federated.add_argument("--query", required=True)
+    federated.add_argument("--limit", type=int, default=20)
+    federated.add_argument("--max-characters", type=int, default=14000)
+    federated.add_argument(
         "--module",
         action="append",
         default=[],
@@ -422,16 +466,48 @@ def link_graph(args: argparse.Namespace) -> None:
             "ou caminhos explícitos."
         )
 
-    graph = build_graph(
-        physical_manifest=sources["physical"],
-        functional_fragments=sources["functional"],
-        otbi_catalog=sources["otbi"],
-        rest_catalog=sources["rest"],
-        validated_rules=sources["rules"],
-        entity_aliases=sources["entities"],
-    )
+    build_kwargs = {
+        "physical_manifest": sources["physical"],
+        "functional_fragments": sources["functional"],
+        "otbi_catalog": sources["otbi"],
+        "rest_catalog": sources["rest"],
+        "validated_rules": sources["rules"],
+        "entity_aliases": sources["entities"],
+    }
+
+    if args.output_dir:
+        bundle = build_graph_bundle(**build_kwargs)
+        outputs = write_graph_bundle(args.output_dir, bundle)
+        stats = {
+            layer: graph["stats"]
+            for layer, graph in bundle.items()
+        }
+        print(
+            f"[GRAPH BUNDLE] {stats} gravado em {args.output_dir}. "
+            f"Arquivos: {', '.join(sorted(outputs))}"
+        )
+        return
+
+    graph = build_graph(**build_kwargs)
     write_json(args.output, graph)
     print(f"[GRAPH] {graph['stats']} gravado em {args.output}")
+
+
+def split_existing_graph(args: argparse.Namespace) -> None:
+    graph = read_json(args.graph, {})
+    if not graph.get("nodes"):
+        raise SystemExit(f"Grafo inválido ou vazio: {args.graph}")
+
+    bundle = build_graph_bundle_from_graph(graph)
+    outputs = write_graph_bundle(args.output_dir, bundle)
+    stats = {
+        layer: layer_graph["stats"]
+        for layer, layer_graph in bundle.items()
+    }
+    print(
+        f"[GRAPH BUNDLE] {stats} gravado em {args.output_dir}. "
+        f"Arquivos: {', '.join(sorted(outputs))}"
+    )
 
 
 def run_all(args: argparse.Namespace) -> None:
@@ -507,6 +583,17 @@ def search_graph(args: argparse.Namespace) -> None:
     print(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
+def search_federated_graphs(args: argparse.Namespace) -> None:
+    search = FederatedGraphSearch(args.graph_dir)
+    payload = search.build_prompt_context(
+        args.query,
+        limit=args.limit,
+        max_characters=args.max_characters,
+        module_ids=set(args.module) if args.module else None,
+    )
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
 def main() -> None:
     args = build_parser().parse_args()
     if args.command == "collect-module":
@@ -519,10 +606,14 @@ def main() -> None:
         collect_rest(args)
     elif args.command == "link":
         link_graph(args)
+    elif args.command == "split-graph":
+        split_existing_graph(args)
     elif args.command == "all":
         run_all(args)
     elif args.command == "search":
         search_graph(args)
+    elif args.command == "search-federated":
+        search_federated_graphs(args)
     else:
         raise SystemExit(f"Comando desconhecido: {args.command}")
 

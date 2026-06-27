@@ -10,6 +10,15 @@ from bs4 import BeautifulSoup
 from oracle_knowledge.common import extract_heading_sections, write_json, write_jsonl
 from oracle_knowledge.linker.knowledge_linker import build_graph
 from oracle_knowledge.search.hybrid_search import HybridSearch
+from oracle_knowledge.search.semantic_context import SemanticTextSelector
+
+
+class PipelineEmbeddingModel:
+    def encode(self, texts, **kwargs):
+        return [
+            [1.0, 0.0, 0.0]
+            for _ in texts
+        ]
 
 
 class SectionExtractionTest(unittest.TestCase):
@@ -221,7 +230,12 @@ class KnowledgePipelineTest(unittest.TestCase):
             self.assertGreaterEqual(graph["stats"]["nodes"], 10)
             self.assertGreaterEqual(graph["stats"]["edges"], 8)
 
-            search = HybridSearch(graph)
+            search = HybridSearch(
+                graph,
+                semantic_text_selector=SemanticTextSelector(
+                    model=PipelineEmbeddingModel(),
+                ),
+            )
             results = search.search("orçamento aprovado atual por projeto", limit=10)
             ids = [result["id"] for result in results]
             self.assertIn("ppm.current_approved_budget_version", ids)

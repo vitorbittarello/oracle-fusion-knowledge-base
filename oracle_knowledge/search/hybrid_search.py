@@ -639,6 +639,256 @@ class HybridSearch:
 
         return merge_text_fields(*values)
 
+    @classmethod
+    def _semantic_candidate_text(
+            cls,
+            result: dict[str, Any],
+    ) -> str:
+        """Monta o texto limpo usado para avaliar um candidato."""
+        node = result.get("node", {})
+        values: list[str] = []
+        seen: set[str] = set()
+
+        def append_value(value: Any) -> None:
+            if not isinstance(value, str):
+                return
+
+            compact = " ".join(value.split())
+            key = compact.casefold()
+
+            if not compact or key in seen:
+                return
+
+            seen.add(key)
+            values.append(compact)
+
+        append_value(
+            f"Title: {result.get('title') or node.get('title') or ''}."
+        )
+        append_value(
+            f"Object type: {result.get('node_type') or node.get('node_type') or ''}."
+        )
+        append_value(node.get("qualified_name"))
+        append_value(node.get("entity_id"))
+        append_value(node.get("table_name"))
+        append_value(node.get("column_name"))
+
+        for field_name in (
+                "aliases",
+                "keywords",
+                "tables",
+                "columns",
+                "subject_areas",
+        ):
+            field_value = node.get(field_name, [])
+
+            if not isinstance(field_value, list):
+                continue
+
+            for value in field_value:
+                append_value(value)
+
+        append_value(cls._context_summary_source(node))
+
+        source_type = result.get(
+            "source",
+            {},
+        ).get("source_type")
+
+        if source_type:
+            append_value(f"Source type: {source_type}.")
+
+        return "\n".join(values)
+
+    def _semantic_rerank_results(
+            self,
+            query: str,
+            results: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """
+        Reordena e filtra candidatos usando relevância semântica.
+
+        A pontuação semântica é combinada com o score híbrido existente. Os
+        primeiros resultados da busca e o melhor representante de cada grupo
+        relevante são preservados para não perder correspondências exatas ou
+        diversidade de fontes. Os demais candidatos precisam superar um piso
+        relativo de relevância para participar da montagem do contexto.
+        """
+        if not results or not query.strip():
+            return results
+
+        documents = [
+            self._semantic_candidate_text(result)
+            for result in results
+        ]
+        semantic_scores = (
+            self.semantic_text_selector.score_documents(
+                query,
+                documents,
+            )
+        )
+
+        if len(semantic_scores) != len(results):
+            raise RuntimeError(
+                "O reranking semântico devolveu uma quantidade de scores "
+                "diferente da quantidade de candidatos."
+            )
+
+        maximum_search_score = max(
+            (float(result.get("score") or 0.0) for result in results),
+            default=0.0,
+        )
+        minimum_semantic_score = min(semantic_scores, default=0.0)
+        maximum_semantic_score = max(semantic_scores, default=0.0)
+        semantic_span = (
+            maximum_semantic_score
+            - minimum_semantic_score
+        )
+        semantic_weight = min(
+            max(
+                float(
+                    self.semantic_text_selector.config
+                    .candidate_rerank_weight
+                ),
+                0.0,
+            ),
+            1.0,
+        )
+        ranked: list[dict[str, Any]] = []
+
+        for search_rank, (result, semantic_score) in enumerate(
+                zip(results, semantic_scores),
+                start=1,
+        ):
+            search_score = max(
+                float(result.get("score") or 0.0),
+                0.0,
+            )
+            search_relative = (
+                math.sqrt(search_score / maximum_search_score)
+                if maximum_search_score > 0.0
+                else 0.0
+            )
+
+            if semantic_span > 0.000001:
+                semantic_relative = (
+                    float(semantic_score)
+                    - minimum_semantic_score
+                ) / semantic_span
+            else:
+                semantic_relative = 1.0
+
+            context_score = (
+                semantic_weight * semantic_relative
+                + (1.0 - semantic_weight) * search_relative
+            )
+            enriched = dict(result)
+            enriched["search_rank"] = search_rank
+            enriched["semantic_score"] = round(
+                float(semantic_score),
+                6,
+            )
+            enriched["context_score"] = round(
+                context_score,
+                6,
+            )
+            ranked.append(enriched)
+
+        best_context_score = max(
+            (float(result["context_score"]) for result in ranked),
+            default=0.0,
+        )
+        minimum_relative_score = min(
+            max(
+                0.0,
+                float(
+                    self.semantic_text_selector.config
+                    .candidate_minimum_relative_score
+                ),
+            ),
+            1.0,
+        )
+        relative_floor = (
+            best_context_score
+            * minimum_relative_score
+        )
+        preserved_ids: set[str] = {
+            result["id"]
+            for result in ranked[:max(
+                0,
+                int(
+                    self.semantic_text_selector.config
+                    .candidate_preserve_top_results
+                ),
+            )]
+        }
+        top_search_score = max(
+            (float(result.get("score") or 0.0) for result in ranked),
+            default=0.0,
+        )
+        group_score_ratio = min(
+            max(
+                0.0,
+                float(
+                    self.semantic_text_selector.config
+                    .candidate_group_score_ratio
+                ),
+            ),
+            1.0,
+        )
+        group_floor = (
+            top_search_score
+            * group_score_ratio
+        )
+        candidates_by_group: dict[str, list[dict[str, Any]]] = defaultdict(list)
+
+        for result in ranked:
+            group = self._context_evidence_group(result)
+
+            if group == "exploratory":
+                continue
+
+            candidates_by_group[group].append(result)
+
+        for group, group_results in candidates_by_group.items():
+            best_group_search_score = max(
+                float(result.get("score") or 0.0)
+                for result in group_results
+            )
+
+            if (
+                    best_group_search_score < group_floor
+                    and group != "validated_rules"
+            ):
+                continue
+
+            best_group_result = max(
+                group_results,
+                key=lambda result: (
+                    float(result["context_score"]),
+                    -int(result["search_rank"]),
+                ),
+            )
+            preserved_ids.add(best_group_result["id"])
+
+        filtered = [
+            result
+            for result in ranked
+            if (
+                result["id"] in preserved_ids
+                or float(result["context_score"]) >= relative_floor
+            )
+        ]
+        filtered.sort(
+            key=lambda result: (
+                -float(result["context_score"]),
+                int(result["search_rank"]),
+                result["title"],
+            )
+        )
+
+        return filtered
+
     @staticmethod
     def _summary(node: dict[str, Any], max_length: int = 500) -> str:
         text = HybridSearch._context_summary_source(node)
@@ -674,7 +924,7 @@ class HybridSearch:
         if node_type == "physical_column":
             return "physical_columns"
 
-        if node_type == "physical_table":
+        if node_type in {"physical_table", "physical_table_stub"}:
             return "physical_tables"
 
         if node_type in {
@@ -805,12 +1055,107 @@ class HybridSearch:
         return remaining
 
     @classmethod
+    def _render_context_item(
+            cls,
+            row: dict[str, Any],
+            index: int,
+    ) -> str:
+        """Renderiza uma evidência exatamente como será enviada à LLM."""
+        evidence_group = cls._context_evidence_group(row)
+        source_type = row.get(
+            "source",
+            {},
+        ).get(
+            "source_type",
+            "unknown",
+        )
+        modules = ",".join(
+            row.get("modules", [])
+        ) or "n/a"
+
+        lines = [
+            "\n"
+            f"{index}. {row['title']} "
+            f"| grupo={evidence_group} "
+            f"| fonte={source_type} "
+            f"| tipo={row['node_type']} "
+            f"| módulos={modules} "
+            f"| score={row['score']}"
+        ]
+
+        if row.get("summary"):
+            lines.append(
+                f"   {row['summary']}"
+            )
+
+        if row.get("evidence"):
+            lines.append(
+                "   Evidência estruturada: "
+                + json.dumps(
+                    row["evidence"],
+                    ensure_ascii=False,
+                )
+            )
+
+        url = row.get(
+            "source",
+            {},
+        ).get("url")
+
+        if url:
+            lines.append(
+                f"   Fonte: {url}"
+            )
+
+        return "\n".join(lines)
+
+    @classmethod
+    def _render_prompt_context(
+            cls,
+            query: str,
+            rows: list[dict[str, Any]],
+    ) -> str:
+        """Monta o texto final usado como contexto pela LLM."""
+        context_lines = [
+            "OBJETIVO",
+            query,
+            "",
+            "EVIDÊNCIAS RECUPERADAS",
+        ]
+
+        for index, row in enumerate(
+                rows,
+                start=1,
+        ):
+            context_lines.append(
+                cls._render_context_item(
+                    row,
+                    index,
+                )
+            )
+
+        context_lines.extend(
+            [
+                "",
+                "REGRAS DE RESPOSTA",
+                "- Priorize regras validadas no ambiente sobre inferências automáticas.",
+                "- Não invente filtros, joins, significados de códigos ou granularidade.",
+                "- Diferencie fatos documentados de inferências.",
+                "- Respeite o grão indicado e alerte sobre risco de duplicidade.",
+                "- OBJECT_VERSION_NUMBER é controle otimista, salvo evidência funcional em contrário.",
+            ]
+        )
+
+        return "\n".join(context_lines)
+
+    @classmethod
     def _diversify_selection(
             cls,
             blocks: list[dict[str, Any]],
             *,
             max_items: int,
             max_characters: int,
+            query: str = "",
             equal_budget_fraction: float = 0.40,
             min_relative_score_ratio: float = 0.05,
             min_group_score_ratio: float = 0.10,
@@ -818,24 +1163,18 @@ class HybridSearch:
             maximum_summary_characters: int = 500,
     ) -> list[dict[str, Any]]:
         """
-        Distribui o orçamento do contexto entre categorias relevantes.
+        Seleciona evidências usando o tamanho real do prompt renderizado.
 
-        O orçamento é calculado em três partes:
+        O melhor item de cada categoria relevante recebe representação
+        mínima. Depois disso, todos os candidatos restantes disputam o
+        orçamento pela ordem global do ranking, sem cotas adicionais por
+        categoria. O saldo final é usado para ampliar os resumos dos itens
+        selecionados, preservando os textos estruturados integralmente.
 
-        1. custo estrutural mínimo do melhor item de cada grupo;
-        2. parcela igualitária entre os grupos representados;
-        3. parcela proporcional ao maior score de cada grupo.
-
-        Depois da representação mínima, candidatos adicionais competem
-        dentro do orçamento do próprio grupo pela ordem global do
-        ranking. Sobras são redistribuídas globalmente pelo mesmo
-        ranking. O texto ainda não é resumido aqui; cada item recebe um
-        orçamento dinâmico que será consumido por SemanticTextSelector
-        em build_prompt_context().
-
-        O método preserva a ordem relativa original dos resultados e
-        nunca força categorias cujo melhor score esteja muito distante
-        do melhor grupo recuperado.
+        ``equal_budget_fraction`` permanece no contrato público do método.
+        Ele controla a parcela do saldo textual distribuída igualmente entre
+        os itens selecionados; a parcela restante é distribuída
+        proporcionalmente ao score.
         """
         if (
                 not blocks
@@ -843,20 +1182,6 @@ class HybridSearch:
                 or max_characters <= 0
         ):
             return []
-
-        group_priority = (
-            "validated_rules",
-            "physical_columns",
-            "physical_tables",
-            "business_context",
-            "otbi",
-            "rest",
-            "functional_documentation",
-        )
-        priority_index = {
-            group: index
-            for index, group in enumerate(group_priority)
-        }
 
         equal_budget_fraction = min(
             max(float(equal_budget_fraction), 0.0),
@@ -874,8 +1199,6 @@ class HybridSearch:
         prepared: list[dict[str, Any]] = []
 
         for rank_index, block in enumerate(blocks):
-            public_block = cls._public_context_block(block)
-            public_block["summary"] = ""
             summary_source = " ".join(
                 str(
                     block.get("_summary_source")
@@ -883,24 +1206,22 @@ class HybridSearch:
                     or ""
                 ).split()
             )
-            fixed_size = len(
-                json.dumps(
-                    public_block,
-                    ensure_ascii=False,
-                )
-            )
             summary_cap = min(
                 len(summary_source),
                 maximum_summary_characters,
             )
+
+            selection_score = block.get("_selection_score")
+
+            if selection_score is None:
+                selection_score = block.get("score")
 
             prepared.append(
                 {
                     "rank_index": rank_index,
                     "block": block,
                     "group": cls._context_evidence_group(block),
-                    "score": float(block.get("score") or 0.0),
-                    "fixed_size": fixed_size,
+                    "score": float(selection_score or 0.0),
                     "summary_cap": summary_cap,
                     "summary_allocation": 0,
                     "summary_capacity": summary_cap,
@@ -942,92 +1263,50 @@ class HybridSearch:
             float(min_group_score_ratio),
         )
 
-        eligible_groups = [
+        eligible_groups = {
             group
             for group, score in group_best_score.items()
             if (
                 score >= group_floor
                 or group == "validated_rules"
             )
-        ]
-        eligible_groups.sort(
-            key=lambda group: (
-                -group_best_score[group],
-                priority_index.get(group, len(group_priority)),
-            )
-        )
-        eligible_groups = eligible_groups[:max_items]
-
-        selected_groups: list[str] = []
-        minimum_group_cost: dict[str, int] = {}
-        minimum_used = 0
-
-        for group in eligible_groups:
-            top_item = candidates_by_group[group][0]
-            fixed_size = int(top_item["fixed_size"])
-
-            if minimum_used + fixed_size > max_characters:
-                continue
-
-            selected_groups.append(group)
-            minimum_group_cost[group] = fixed_size
-            minimum_used += fixed_size
-
-        if not selected_groups:
-            fallback = relevant[0]
-            if fallback["fixed_size"] > max_characters:
-                return []
-            selected_groups = [fallback["group"]]
-            minimum_group_cost[fallback["group"]] = fallback["fixed_size"]
-            minimum_used = fallback["fixed_size"]
-
-        remaining_for_groups = max_characters - minimum_used
-        equal_pool = int(
-            remaining_for_groups * equal_budget_fraction
-        )
-        proportional_pool = remaining_for_groups - equal_pool
-        group_budgets = dict(minimum_group_cost)
-
-        equal_share, equal_remainder = divmod(
-            equal_pool,
-            len(selected_groups),
-        )
-        for index, group in enumerate(selected_groups):
-            group_budgets[group] += equal_share
-            if index < equal_remainder:
-                group_budgets[group] += 1
-
-        score_sum = sum(
-            max(group_best_score.get(group, 0.0), 0.000001)
-            for group in selected_groups
-        )
-        proportional_allocated = 0
-
-        for group in selected_groups:
-            weight = max(
-                group_best_score.get(group, 0.0),
-                0.000001,
-            )
-            share = int(
-                proportional_pool * weight / score_sum
-            )
-            group_budgets[group] += share
-            proportional_allocated += share
-
-        unallocated = proportional_pool - proportional_allocated
-        for group in selected_groups:
-            if unallocated <= 0:
-                break
-            group_budgets[group] += 1
-            unallocated -= 1
+        }
 
         selected_items: list[dict[str, Any]] = []
         selected_ranks: set[int] = set()
-        group_used: Counter[str] = Counter()
 
-        def add_item(
+        def public_rows(
+                items: list[dict[str, Any]],
+        ) -> list[dict[str, Any]]:
+            rows: list[dict[str, Any]] = []
+
+            for item in sorted(
+                    items,
+                    key=lambda candidate: candidate["rank_index"],
+            ):
+                row = cls._public_context_block(
+                    item["block"]
+                )
+                allocation = int(
+                    item.get("summary_allocation", 0)
+                )
+                row["summary"] = "x" * allocation
+                rows.append(row)
+
+            return rows
+
+        def projected_length(
+                items: list[dict[str, Any]],
+        ) -> int:
+            return len(
+                cls._render_prompt_context(
+                    query,
+                    public_rows(items),
+                )
+            )
+
+        def try_add(
                 item: dict[str, Any],
-                *,
                 summary_characters: int,
         ) -> bool:
             if (
@@ -1036,149 +1315,189 @@ class HybridSearch:
             ):
                 return False
 
-            summary_characters = min(
+            allocation = min(
                 max(0, int(summary_characters)),
                 int(item["summary_cap"]),
             )
-            item["summary_allocation"] = summary_characters
+            item["summary_allocation"] = allocation
             item["summary_capacity"] = (
                 int(item["summary_cap"])
-                - summary_characters
+                - allocation
             )
             selected_items.append(item)
             selected_ranks.add(item["rank_index"])
-            group_used[item["group"]] += (
-                int(item["fixed_size"])
-                + summary_characters
-            )
-            return True
 
-        # Um representante estrutural por grupo relevante.
-        for group in selected_groups:
-            item = candidates_by_group[group][0]
-            available = max(
-                0,
-                group_budgets[group] - int(item["fixed_size"]),
+            if projected_length(selected_items) <= max_characters:
+                return True
+
+            selected_items.pop()
+            selected_ranks.remove(item["rank_index"])
+            item["summary_allocation"] = 0
+            item["summary_capacity"] = int(
+                item["summary_cap"]
             )
+            return False
+
+        # Garante somente um representante do melhor resultado de cada
+        # categoria relevante. A ordem de tentativa segue o ranking global.
+        representative_items = sorted(
+            (
+                candidates_by_group[group][0]
+                for group in eligible_groups
+            ),
+            key=lambda item: item["rank_index"],
+        )
+
+        for item in representative_items:
             initial_summary = min(
                 int(item["summary_cap"]),
                 minimum_summary_characters,
-                available,
-            )
-            add_item(
-                item,
-                summary_characters=initial_summary,
             )
 
-        # Candidatos adicionais disputam apenas o orçamento do seu grupo
-        # e seguem exatamente a ordem global do ranking.
+            if try_add(item, initial_summary):
+                continue
+
+            # Em orçamento muito apertado, preserva a evidência estruturada
+            # do representante mesmo sem texto narrativo.
+            try_add(item, 0)
+
+        # Todo o restante do orçamento é disputado pelo ranking global.
+        # Nenhuma categoria recebe um segundo item por possuir saldo próprio.
         for item in relevant:
             if len(selected_items) >= max_items:
-                break
-
-            group = item["group"]
-            if (
-                    group not in group_budgets
-                    or item["rank_index"] in selected_ranks
-            ):
-                continue
-
-            minimum_summary = min(
-                int(item["summary_cap"]),
-                minimum_summary_characters,
-            )
-            required = int(item["fixed_size"]) + minimum_summary
-            available = group_budgets[group] - group_used[group]
-
-            if required > available:
-                continue
-
-            add_item(
-                item,
-                summary_characters=minimum_summary,
-            )
-
-        # Usa o saldo de cada categoria para enriquecer semanticamente
-        # os itens já selecionados daquele grupo.
-        for group in selected_groups:
-            group_items = [
-                item
-                for item in selected_items
-                if item["group"] == group
-            ]
-            available = max(
-                0,
-                group_budgets[group] - group_used[group],
-            )
-            unused = cls._distribute_character_budget(
-                group_items,
-                available,
-                capacity_key="summary_capacity",
-                allocation_key="summary_allocation",
-            )
-            group_used[group] += available - unused
-
-        used = sum(
-            int(item["fixed_size"])
-            + int(item["summary_allocation"])
-            for item in selected_items
-        )
-        remaining_global = max(0, max_characters - used)
-
-        # Redistribuição global por ranking: primeiro enriquece ou inclui
-        # as evidências mais bem pontuadas; somente depois alcança itens
-        # exploratórios ou de menor score.
-        for item in relevant:
-            if remaining_global <= 0:
                 break
 
             if item["rank_index"] in selected_ranks:
-                capacity = int(item["summary_capacity"])
-                increment = min(capacity, remaining_global)
-                item["summary_allocation"] += increment
-                item["summary_capacity"] -= increment
-                remaining_global -= increment
                 continue
 
-            if len(selected_items) >= max_items:
-                continue
-
-            minimum_summary = min(
+            initial_summary = min(
                 int(item["summary_cap"]),
                 minimum_summary_characters,
             )
-            required = int(item["fixed_size"]) + minimum_summary
 
-            if required > remaining_global:
+            if try_add(item, initial_summary):
                 continue
 
-            add_item(
-                item,
-                summary_characters=minimum_summary,
-            )
-            remaining_global -= required
+            # Itens sem fonte textual ainda podem ser úteis por sua evidência
+            # estruturada e não precisam reservar um resumo inexistente.
+            if int(item["summary_cap"]) == 0:
+                try_add(item, 0)
 
-        if remaining_global > 0:
-            remaining_global = cls._distribute_character_budget(
-                selected_items,
-                remaining_global,
-                capacity_key="summary_capacity",
-                allocation_key="summary_allocation",
+        if not selected_items:
+            return []
+
+        # Usa o saldo real do prompt para enriquecer os resumos. Como todos
+        # os cálculos usam a mesma renderização do contexto final, não entram
+        # na conta id, sources, caminhos locais ou outros metadados do JSON.
+        remaining = max(
+            0,
+            max_characters - projected_length(selected_items),
+        )
+        active = [
+            item
+            for item in selected_items
+            if int(item.get("summary_capacity", 0)) > 0
+        ]
+
+        equal_pool = int(
+            remaining * equal_budget_fraction
+        )
+        proportional_pool = remaining - equal_pool
+
+        # Parcela igualitária do saldo textual.
+        while equal_pool > 0 and active:
+            active = [
+                item
+                for item in active
+                if int(item.get("summary_capacity", 0)) > 0
+            ]
+
+            if not active:
+                break
+
+            share = max(1, equal_pool // len(active))
+            allocated = 0
+
+            for item in active:
+                if equal_pool <= 0:
+                    break
+
+                increment = min(
+                    share,
+                    int(item["summary_capacity"]),
+                    equal_pool,
+                )
+
+                if increment <= 0:
+                    continue
+
+                item["summary_allocation"] += increment
+                item["summary_capacity"] -= increment
+                equal_pool -= increment
+                allocated += increment
+
+            if allocated <= 0:
+                break
+
+        proportional_pool += equal_pool
+        cls._distribute_character_budget(
+            selected_items,
+            proportional_pool,
+            capacity_key="summary_capacity",
+            allocation_key="summary_allocation",
+        )
+
+        # Se um item sem resumo passou de zero durante a distribuição, a linha
+        # narrativa adiciona alguns caracteres fixos. Remove o eventual
+        # excesso começando pelos itens de menor score.
+        while projected_length(selected_items) > max_characters:
+            overflow = (
+                projected_length(selected_items)
+                - max_characters
             )
+            reducible = sorted(
+                (
+                    item
+                    for item in selected_items
+                    if int(item.get("summary_allocation", 0)) > 0
+                ),
+                key=lambda item: (
+                    item["score"],
+                    -item["rank_index"],
+                ),
+            )
+
+            if not reducible:
+                break
+
+            item = reducible[0]
+            reduction = min(
+                int(item["summary_allocation"]),
+                max(1, overflow),
+            )
+            item["summary_allocation"] -= reduction
+            item["summary_capacity"] += reduction
 
         selected_items.sort(
             key=lambda item: item["rank_index"]
         )
 
         selected_blocks: list[dict[str, Any]] = []
-        for item in selected_items:
+        placeholder_rows = public_rows(selected_items)
+
+        for index, (item, placeholder_row) in enumerate(
+                zip(selected_items, placeholder_rows),
+                start=1,
+        ):
             block = dict(item["block"])
-            block["_allocated_characters"] = (
-                int(item["fixed_size"])
-                + int(item["summary_allocation"])
-            )
             block["_summary_max_characters"] = int(
                 item["summary_allocation"]
+            )
+            block["_allocated_characters"] = len(
+                cls._render_context_item(
+                    placeholder_row,
+                    index,
+                )
             )
             selected_blocks.append(block)
 
@@ -1280,49 +1599,35 @@ class HybridSearch:
             )
         }
 
-    def build_prompt_context(
+    def build_prompt_context_from_results(
             self,
             query: str,
+            results: list[dict[str, Any]],
             *,
             limit: int = 16,
             max_characters: int = 14000,
-            module_ids: set[str] | None = None,
     ) -> dict[str, Any]:
+        """Monta o contexto a partir de resultados previamente selecionados.
+
+        Este método não executa busca nem reranking. Ele é usado quando outro
+        componente, como o orquestrador federado, já decidiu quais nós devem
+        participar do contexto e precisa apenas aplicar orçamento, resumo
+        semântico e renderização final.
         """
-        Monta o contexto da LLM a partir dos resultados já ranqueados.
-
-        A busca recupera mais candidatos do que o limite final. Em
-        seguida, o orçamento é distribuído entre as categorias
-        relevantes e cada item recebe um limite textual próprio.
-        SemanticTextSelector só é executado depois dessa distribuição,
-        usando o espaço efetivamente disponível para o item.
-
-        Busca, score, expansão do grafo e ranking permanecem
-        inalterados. O parâmetro limit continua representando a
-        quantidade máxima de evidências no contexto final.
-        """
-        candidate_limit = max(
-            limit,
-            limit * 3,
-            limit + 12,
-        )
-
-        results = self.search(
-            query,
-            limit=candidate_limit,
-            module_ids=module_ids,
-        )
-
         blocks: list[dict[str, Any]] = []
 
         for result in results:
             node = result["node"]
             summary_source = (
                 self._context_summary_source(node)
-                or result["summary"]
+                or result.get("summary")
+                or ""
             )
 
-            if result["node_type"] == "physical_table":
+            if result["node_type"] in {
+                "physical_table",
+                "physical_table_stub",
+            }:
                 evidence = self._physical_table_context_evidence(node)
             else:
                 evidence = self._evidence_payload(node)
@@ -1333,12 +1638,19 @@ class HybridSearch:
                     "node_type": result["node_type"],
                     "title": result["title"],
                     "score": result["score"],
+                    "search_rank": result.get("search_rank"),
+                    "semantic_score": result.get("semantic_score"),
+                    "context_score": result.get("context_score"),
                     "summary": "",
-                    "source": result["source"],
+                    "source": result.get("source", {}),
                     "sources": result.get("sources", []),
                     "modules": result.get("modules", []),
                     "evidence": evidence,
                     "_summary_source": summary_source,
+                    "_selection_score": result.get(
+                        "context_score",
+                        result["score"],
+                    ),
                 }
             )
 
@@ -1346,6 +1658,7 @@ class HybridSearch:
             blocks,
             max_items=limit,
             max_characters=max_characters,
+            query=query,
             maximum_summary_characters=(
                 self.semantic_text_selector.config
                 .summary_max_characters
@@ -1359,145 +1672,71 @@ class HybridSearch:
                 budgeted_block.get("_summary_source")
                 or ""
             )
-            allocated_characters = int(
-                budgeted_block.get("_allocated_characters")
-                or 0
-            )
             allocated_summary = int(
                 budgeted_block.get("_summary_max_characters")
                 or 0
-            )
-
-            public_block = self._public_context_block(
-                budgeted_block
-            )
-            public_block["summary"] = ""
-            fixed_size = len(
-                json.dumps(
-                    public_block,
-                    ensure_ascii=False,
-                )
-            )
-            available_summary = min(
-                allocated_summary,
-                max(0, allocated_characters - fixed_size),
             )
 
             semantic_summary = (
                 self.semantic_text_selector.select_relevant_text(
                     query,
                     summary_source,
-                    max_characters=available_summary,
+                    max_characters=allocated_summary,
                 )
             )
 
-            while semantic_summary:
-                encoded_size = len(
-                    json.dumps(
-                        semantic_summary,
-                        ensure_ascii=False,
-                    )
-                ) - 2
-
-                if encoded_size <= available_summary:
-                    break
-
-                overflow = encoded_size - available_summary
-                new_length = max(
-                    0,
-                    len(semantic_summary) - max(1, overflow),
-                )
-                semantic_summary = semantic_summary[:new_length].rstrip()
-
+            public_block = self._public_context_block(
+                budgeted_block
+            )
             public_block["summary"] = semantic_summary
             selected.append(public_block)
 
-        used = sum(
-            len(
-                json.dumps(
-                    block,
-                    ensure_ascii=False,
-                )
-            )
-            for block in selected
-        )
+        context = self._render_prompt_context(query, selected)
 
-        context_lines = [
-            "OBJETIVO",
-            query,
-            "",
-            "EVIDÊNCIAS RECUPERADAS",
-        ]
-
-        # A apresentação segue a ordem original do ranking.
-        # A categoria é informada em cada linha, sem reagrupar ou
-        # reposicionar os resultados por tipo ou fonte.
-        for index, row in enumerate(
-                selected,
-                start=1,
-        ):
-            evidence_group = self._context_evidence_group(row)
-            source_type = row.get(
-                "source",
-                {},
-            ).get(
-                "source_type",
-                "unknown",
-            )
-
-            context_lines.append(
-                "\n"
-                f"{index}. {row['title']} "
-                f"| grupo={evidence_group} "
-                f"| fonte={source_type} "
-                f"| tipo={row['node_type']} "
-                f"| módulos="
-                f"{','.join(row.get('modules', [])) or 'n/a'} "
-                f"| score={row['score']}"
-            )
-
-            if row["summary"]:
-                context_lines.append(
-                    f"   {row['summary']}"
-                )
-
-            if row["evidence"]:
-                context_lines.append(
-                    "   Evidência estruturada: "
-                    + json.dumps(
-                        row["evidence"],
-                        ensure_ascii=False,
-                    )
-                )
-
-            url = row.get(
-                "source",
-                {},
-            ).get("url")
-
-            if url:
-                context_lines.append(
-                    f"   Fonte: {url}"
-                )
-
-        context_lines.extend(
-            [
-                "",
-                "REGRAS DE RESPOSTA",
-                "- Priorize regras validadas no ambiente sobre inferências automáticas.",
-                "- Não invente filtros, joins, significados de códigos ou granularidade.",
-                "- Diferencie fatos documentados de inferências.",
-                "- Respeite o grão indicado e alerte sobre risco de duplicidade.",
-                "- OBJECT_VERSION_NUMBER é controle otimista, salvo evidência funcional em contrário.",
+        while len(context) > max_characters:
+            reducible_indexes = [
+                index
+                for index, row in enumerate(selected)
+                if row.get("summary")
             ]
-        )
+            if not reducible_indexes:
+                break
+            index = reducible_indexes[-1]
+            overflow = len(context) - max_characters
+            summary = str(selected[index]["summary"])
+            new_length = max(0, len(summary) - max(1, overflow))
+            selected[index]["summary"] = summary[:new_length].rstrip()
+            context = self._render_prompt_context(query, selected)
 
         return {
             "query": query,
-            "context": "\n".join(context_lines),
+            "context": context,
             "results": selected,
-            "characters": used,
+            "characters": len(context),
         }
+
+    def build_prompt_context(
+            self,
+            query: str,
+            *,
+            limit: int = 16,
+            max_characters: int = 14000,
+            module_ids: set[str] | None = None,
+    ) -> dict[str, Any]:
+        """Executa busca, reranking e montagem do contexto."""
+        candidate_limit = max(limit, limit * 3, limit + 12)
+        results = self.search(
+            query,
+            limit=candidate_limit,
+            module_ids=module_ids,
+        )
+        results = self._semantic_rerank_results(query, results)
+        return self.build_prompt_context_from_results(
+            query,
+            results,
+            limit=limit,
+            max_characters=max_characters,
+        )
 
     @staticmethod
     def _evidence_payload(node: dict[str, Any]) -> dict[str, Any]:
