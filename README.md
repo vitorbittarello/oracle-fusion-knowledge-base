@@ -102,8 +102,8 @@ Exemplo:
 ```text
 Domínio organizacional: Suprimentos
 Processo: Leilão de fornecedores
-Sistema especialista: OCY
-Objeto especialista: OCY_AUCTION_HEADER
+Sistema especialista: ACME
+Objeto especialista: ACME_AUCTION_HEADER
 Objeto Oracle Fusion: PON_AUCTION_HEADERS_ALL
 Módulo técnico Oracle: Procurement
 ```
@@ -1188,7 +1188,7 @@ Além da documentação Oracle, podem ser usadas como evidência corporativa:
 
 Views Gold ajudam a identificar aliases funcionais, joins utilizados, filtros de idioma, grão e linhagem até as tabelas Silver. Mapeamentos de integração ajudam a registrar origem, destino, direção do fluxo, chave de integração e sistema de autoridade.
 
-Essas fontes não devem criar equivalência automática. Por exemplo, `OCY_AUCTION_HEADER` pode integrar-se com `PON_AUCTION_HEADERS_ALL` sem possuir necessariamente o mesmo grão ou o mesmo ciclo de vida. Registre a relação conforme a evidência disponível.
+Essas fontes não devem criar equivalência automática. Por exemplo, `ACME_AUCTION_HEADER` pode integrar-se com `PON_AUCTION_HEADERS_ALL` sem possuir necessariamente o mesmo grão ou o mesmo ciclo de vida. Registre a relação conforme a evidência disponível.
 
 Nesta versão, o registro dessas fontes é feito por curadoria nos arquivos de aliases, regras e mapeamentos usados pelo linker. A importação automática de DDLs Gold e configurações OCI é uma evolução prevista, não um comando disponível atualmente.
 
