@@ -55,8 +55,25 @@ Reúne:
 
 - entidades;
 - atributos;
+- processos e domínios organizacionais;
+- aliases em português e inglês;
 - regras validadas;
-- trechos funcionais.
+- trechos funcionais;
+- referências curadas a objetos técnicos.
+
+A organização funcional da companhia não precisa coincidir com os módulos do ERP. Um processo de Suprimentos, por exemplo, pode usar simultaneamente um sistema especialista, uma integração OCI, tabelas Oracle Fusion Procurement e uma view Gold do lake.
+
+Exemplo:
+
+```text
+Suprimentos / Leilão de fornecedores
+├── OCY_AUCTION_HEADER
+└── PON_AUCTION_HEADERS_ALL
+```
+
+A relação entre os objetos deve indicar se há integração, derivação, materialização ou autoridade. Não considere dois objetos equivalentes apenas porque possuem nomes ou campos parecidos.
+
+Os owners reais dos schemas podem mudar entre ambientes. O conhecimento deve usar um papel lógico, como `gold`, `fusion_silver` ou `specialized_source`, mantendo o owner físico apenas para rastreabilidade.
 
 ### Modelo físico
 
@@ -605,6 +622,29 @@ data/modules/<module_id>/config/entity_aliases.json
 
 Um alias não deve criar centenas de relações por simples ocorrência textual. Ele deve apontar para uma entidade ou atributo e, quando conhecido, para objetos técnicos específicos.
 
+Também podem ser registrados como fontes de conhecimento corporativo:
+
+- views Gold e seus aliases de colunas;
+- SQLs validadas;
+- mapeamentos de integração OCI;
+- objetos de sistemas especialistas;
+- sistema de autoridade de cada processo;
+- relações entre origem, destino e materialização no lake.
+
+Exemplo:
+
+```text
+Domínio: Suprimentos
+Entidade: Leilão de fornecedores
+Sistema especialista: OCY_AUCTION_HEADER
+Oracle Fusion: PON_AUCTION_HEADERS_ALL
+Relação validada: integrates_with
+```
+
+O owner real deve ser abstraído por um papel lógico. Assim, a mesma curadoria pode ser usada em desenvolvimento, homologação e produção sem transformar o nome do schema em parte do significado do objeto.
+
+Nesta versão, essas informações são registradas por curadoria. A leitura automática de DDLs Gold e configurações de integração ainda não faz parte dos comandos disponíveis.
+
 ---
 
 ## 17. Coletar ou atualizar um módulo
@@ -993,7 +1033,7 @@ registro de aliases e regras confirmadas
 nova geração dos grafos
 ```
 
-A ferramenta melhora à medida que o conhecimento validado é registrado, sem transformar simples semelhanças textuais em relações permanentes.
+A ferramenta melhora à medida que o conhecimento validado é registrado, sem transformar simples semelhanças textuais em relações permanentes. Views Gold e integrações corporativas podem enriquecer a camada de negócio, mas suas relações devem manter escopo, origem e confiança.
 
 ---
 
@@ -1052,6 +1092,16 @@ python build_knowledge_base.py build-index \
 
 Sem `--layer`, o sistema verifica todas as camadas e pula as que não mudaram. Dentro da camada alterada, somente nós novos ou cujo conteúdo mudou têm embeddings recalculados.
 
+Escopo usual de rebuild:
+
+| Alteração | Índice afetado |
+|---|---|
+| Alias, conceito corporativo ou rota para objeto existente | `business` e/ou `master` |
+| View Gold usada como conhecimento e linhagem | `business` e `master` |
+| Mapeamento OCI entre objetos já indexados | `business` e `master` |
+| Nova tabela ou coluna física | `physical` |
+| Mudança somente no ranking ou no prompt | nenhum |
+
 Valide depois da atualização:
 
 ### Bash
@@ -1070,4 +1120,42 @@ python build_knowledge_base.py validate-index \
 
 A busca usa o manifesto automaticamente e informa `backend: sqlite_bundle` no bloco `routing`.
 
-GPU NVIDIA com CUDA é recomendada para grandes gerações iniciais, mas a atualização normal de curadoria não deve exigir a reconstrução completa dos índices.
+### CPU e CUDA
+
+**CUDA não é obrigatório.** Os índices podem ser gerados integralmente em CPU. Esse é o modo padrão quando `--semantic-device cuda` não é informado.
+
+#### CPU — Bash
+
+```bash
+python -u build_knowledge_base.py build-index \
+  --graph-dir "./data/graph/scm"
+```
+
+#### CPU — PowerShell
+
+```powershell
+& ".\.venv\Scripts\python.exe" -u build_knowledge_base.py build-index `
+  --graph-dir ".\data\graph\scm"
+```
+
+Quando o computador possui GPU NVIDIA compatível e o ambiente Python possui PyTorch com CUDA, a geração dos embeddings pode ser acelerada:
+
+#### CUDA — Bash
+
+```bash
+python -u build_knowledge_base.py build-index \
+  --graph-dir "./data/graph/scm" \
+  --semantic-device cuda \
+  --semantic-batch-size 64
+```
+
+#### CUDA — PowerShell
+
+```powershell
+& ".\.venv\Scripts\python.exe" -u build_knowledge_base.py build-index `
+  --graph-dir ".\data\graph\scm" `
+  --semantic-device "cuda" `
+  --semantic-batch-size 64
+```
+
+CUDA acelera a inferência do modelo semântico. A gravação SQLite, o FTS5, os hashes e a validação continuam na CPU. Em máquinas sem CUDA, basta omitir a opção. O suporte a GPU melhora a performance, mas não altera o conteúdo funcional do índice nem é requisito para usar o projeto.

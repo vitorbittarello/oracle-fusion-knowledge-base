@@ -13,13 +13,15 @@ Os exemplos de comando são apresentados em **Bash** e **PowerShell**. No Bash, 
 O projeto ajuda a localizar e relacionar:
 
 - entidades e atributos de negócio;
+- processos e domínios organizacionais da companhia;
 - tabelas, views e colunas físicas;
 - chaves primárias, referências e grão documentado;
 - subject areas e perguntas de negócio do OTBI;
 - recursos e operações REST;
 - documentação funcional;
 - aliases curados;
-- regras validadas no ambiente.
+- regras validadas no ambiente;
+- linhagem corporativa proveniente de views Gold e integrações com sistemas especialistas, quando registrada por curadoria.
 
 A saída principal é um contexto rastreável para apoiar:
 
@@ -87,8 +89,28 @@ Contém:
 
 - entidades de negócio;
 - atributos de negócio;
+- processos e domínios organizacionais;
+- aliases funcionais em português e inglês;
 - regras validadas;
-- trechos de documentação funcional.
+- trechos de documentação funcional;
+- referências curadas a implementações técnicas em diferentes sistemas.
+
+A camada de negócio representa a semântica corporativa e não deve ficar limitada à divisão modular do Oracle Fusion. Um mesmo processo pode envolver Oracle Fusion, sistemas especialistas, integrações OCI, tabelas carregadas no lake e views Gold.
+
+Exemplo:
+
+```text
+Domínio organizacional: Suprimentos
+Processo: Leilão de fornecedores
+Sistema especialista: OCY
+Objeto especialista: OCY_AUCTION_HEADER
+Objeto Oracle Fusion: PON_AUCTION_HEADERS_ALL
+Módulo técnico Oracle: Procurement
+```
+
+O domínio organizacional, o sistema de origem e o módulo técnico são dimensões diferentes. A relação entre objetos deve registrar seu significado real, como `integrates_with`, `derived_from`, `materializes` ou `authoritative_for`. Não use `same_as` sem validação de equivalência e de grão.
+
+Owners físicos variam entre ambientes. Por isso, nomes de schema devem ser tratados como metadados ambientais e abstraídos por um papel lógico, por exemplo `gold`, `fusion_silver` ou `specialized_source`. O owner real não deve determinar o ID estável do objeto nem contaminar a busca semântica.
 
 ### `physical.json`
 
@@ -179,6 +201,8 @@ intfloat/multilingual-e5-large-instruct
 ```
 
 Na primeira busca semântica, o modelo pode ser baixado e carregado. A primeira execução tende a ser mais lenta.
+
+> **CUDA não é requisito.** A geração dos índices funciona integralmente em CPU. O projeto também suporta GPU NVIDIA com CUDA para acelerar a criação dos embeddings semânticos, especialmente na primeira indexação de módulos grandes.
 
 ---
 
@@ -1144,10 +1168,29 @@ Use aliases para mapear termos de negócio a:
 
 - entidades;
 - atributos;
+- processos corporativos;
 - tabelas;
 - colunas;
 - subject areas;
-- recursos REST.
+- recursos REST;
+- objetos de sistemas especialistas.
+
+### Fontes corporativas de curadoria
+
+Além da documentação Oracle, podem ser usadas como evidência corporativa:
+
+- views da camada Gold;
+- SQLs homologadas;
+- mapeamentos de integrações OCI;
+- tabelas carregadas de sistemas especialistas;
+- documentação funcional interna;
+- validações feitas pelas áreas responsáveis.
+
+Views Gold ajudam a identificar aliases funcionais, joins utilizados, filtros de idioma, grão e linhagem até as tabelas Silver. Mapeamentos de integração ajudam a registrar origem, destino, direção do fluxo, chave de integração e sistema de autoridade.
+
+Essas fontes não devem criar equivalência automática. Por exemplo, `OCY_AUCTION_HEADER` pode integrar-se com `PON_AUCTION_HEADERS_ALL` sem possuir necessariamente o mesmo grão ou o mesmo ciclo de vida. Registre a relação conforme a evidência disponível.
+
+Nesta versão, o registro dessas fontes é feito por curadoria nos arquivos de aliases, regras e mapeamentos usados pelo linker. A importação automática de DDLs Gold e configurações OCI é uma evolução prevista, não um comando disponível atualmente.
 
 ### Regras validadas
 
@@ -1466,6 +1509,8 @@ Exemplos de escopo:
 |---|---|
 | Alias em português ou inglês | `master`, e possivelmente `business` |
 | Nova rota curada para uma tabela já existente | `master` |
+| Nova view Gold usada apenas como conhecimento de negócio e linhagem | `business` e `master` |
+| Novo mapeamento OCI entre objetos já existentes | `business` e `master` |
 | Nova tabela, coluna, PK ou FK | `physical` |
 | Atualização de subject areas | `otbi_analytics` |
 | Atualização de roles OTBI | `otbi_security` |
@@ -1536,6 +1581,50 @@ A validação confere o manifesto, a associação camada/arquivo, integridade SQ
 
 O parâmetro `--index` também aceita o caminho do `index_bundle.json`, o diretório `search_index` ou um SQLite monolítico legado.
 
-### 22.6 GPU
+### 22.6 CPU, GPU NVIDIA e CUDA
 
-GPU NVIDIA com CUDA é recomendada para a primeira geração de muitos embeddings ou para alterações em massa, mas não é obrigatória. Rebuild seletivo e reutilização por `content_hash` evitam recalcular todo o módulo em atualizações comuns de curadoria.
+**CUDA não é obrigatório para gerar os índices.** O comando `build-index` funciona integralmente em CPU e esta é a forma compatível com qualquer ambiente suportado pelo projeto.
+
+#### Geração em CPU
+
+Não informe `--semantic-device`:
+
+##### Bash
+
+```bash
+python -u build_knowledge_base.py build-index \
+  --graph-dir "./data/graph/scm"
+```
+
+##### PowerShell
+
+```powershell
+& ".\.venv\Scripts\python.exe" -u build_knowledge_base.py build-index `
+  --graph-dir ".\data\graph\scm"
+```
+
+#### Geração com CUDA
+
+Quando houver GPU NVIDIA compatível, driver instalado e PyTorch com suporte CUDA no ambiente virtual, informe:
+
+##### Bash
+
+```bash
+python -u build_knowledge_base.py build-index \
+  --graph-dir "./data/graph/scm" \
+  --semantic-device cuda \
+  --semantic-batch-size 64
+```
+
+##### PowerShell
+
+```powershell
+& ".\.venv\Scripts\python.exe" -u build_knowledge_base.py build-index `
+  --graph-dir ".\data\graph\scm" `
+  --semantic-device "cuda" `
+  --semantic-batch-size 64
+```
+
+CUDA acelera principalmente a geração dos embeddings semânticos. A criação das tabelas SQLite, FTS5, hashes, metadados e validações continua sendo executada pela CPU. O ganho tende a ser mais relevante na primeira indexação de módulos grandes ou em alterações em massa.
+
+Em ambientes sem CUDA, omita `--semantic-device cuda`. O rebuild seletivo por camada e a reutilização por `content_hash` reduzem a necessidade de recalcular embeddings, portanto CUDA é uma otimização de desempenho, não uma dependência funcional.
