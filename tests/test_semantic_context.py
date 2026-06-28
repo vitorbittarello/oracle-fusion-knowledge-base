@@ -78,7 +78,49 @@ class CandidateEmbeddingModel:
         return np.asarray(vectors, dtype=np.float32)
 
 
+class CountingEmbeddingModel(FakeEmbeddingModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.query_calls = 0
+        self.document_calls = 0
+
+    def encode(self, texts, **kwargs):
+        if texts and texts[0].startswith("Instruct:"):
+            self.query_calls += 1
+        else:
+            self.document_calls += 1
+        return super().encode(texts, **kwargs)
+
+
 class SemanticTextSelectorTest(unittest.TestCase):
+    def test_batch_summary_selection_reuses_query_and_document_encoding(self):
+        model = CountingEmbeddingModel()
+        selector = SemanticTextSelector(
+            SemanticContextConfig(
+                maximum_segment_characters=80,
+            ),
+            model=model,
+        )
+
+        summaries = selector.select_relevant_texts(
+            "payment terms and supplier",
+            [
+                (
+                    "Payment terms define settlement conditions. "
+                    "Audit columns record technical updates."
+                ),
+                (
+                    "Supplier information identifies the trading partner. "
+                    "Agreement dates define the validity period."
+                ),
+            ],
+            max_characters=[60, 60],
+        )
+
+        self.assertEqual(len(summaries), 2)
+        self.assertEqual(model.query_calls, 1)
+        self.assertEqual(model.document_calls, 1)
+
     def test_score_documents_uses_most_relevant_segments(self):
         selector = SemanticTextSelector(
             SemanticContextConfig(

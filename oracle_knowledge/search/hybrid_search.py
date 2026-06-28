@@ -1606,6 +1606,7 @@ class HybridSearch:
             *,
             limit: int = 16,
             max_characters: int = 14000,
+            query_vector: Any | None = None,
     ) -> dict[str, Any]:
         """Monta o contexto a partir de resultados previamente selecionados.
 
@@ -1665,26 +1666,39 @@ class HybridSearch:
             ),
         )
 
-        selected: list[dict[str, Any]] = []
-
-        for budgeted_block in selected_with_budget:
-            summary_source = str(
-                budgeted_block.get("_summary_source")
-                or ""
-            )
-            allocated_summary = int(
-                budgeted_block.get("_summary_max_characters")
-                or 0
-            )
-
-            semantic_summary = (
-                self.semantic_text_selector.select_relevant_text(
+        summary_sources = [
+            str(block.get("_summary_source") or "")
+            for block in selected_with_budget
+        ]
+        summary_budgets = [
+            int(block.get("_summary_max_characters") or 0)
+            for block in selected_with_budget
+        ]
+        if query_vector is None:
+            semantic_summaries = (
+                self.semantic_text_selector.select_relevant_texts(
                     query,
-                    summary_source,
-                    max_characters=allocated_summary,
+                    summary_sources,
+                    max_characters=summary_budgets,
+                )
+            )
+        else:
+            semantic_summaries = (
+                self.semantic_text_selector
+                .select_relevant_texts_with_query_vector(
+                    query_vector,
+                    summary_sources,
+                    max_characters=summary_budgets,
                 )
             )
 
+        selected: list[dict[str, Any]] = []
+
+        for budgeted_block, semantic_summary in zip(
+            selected_with_budget,
+            semantic_summaries,
+            strict=True,
+        ):
             public_block = self._public_context_block(
                 budgeted_block
             )

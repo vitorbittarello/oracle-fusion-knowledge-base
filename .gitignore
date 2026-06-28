@@ -7,6 +7,10 @@ data/functional/*.jsonl
 data/otbi/*.json
 data/rest/*.json
 data/graph/*.json
+data/graph/
+data/modules/
 !data/**/.gitkeep
-
+oracle_fusion_knowledge_base.egg-info/
+*.patch
+*.log
 .idea/

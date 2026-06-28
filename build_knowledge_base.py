@@ -26,14 +26,24 @@ from oracle_knowledge.linker.graph_layers import (
     build_graph_bundle_from_graph,
     write_graph_bundle,
 )
-from oracle_knowledge.indexing import build_search_index, default_index_path
+from oracle_knowledge.indexing import (
+    build_index_bundle,
+    build_search_index,
+    resolve_index_source,
+)
 from oracle_knowledge.search.hybrid_search import HybridSearch, SearchConfig
 from oracle_knowledge.search.federated_search import FederatedGraphSearch
+from oracle_knowledge.search.semantic_context import (
+    DEFAULT_EMBEDDING_MODEL,
+    SemanticContextConfig,
+    SemanticTextSelector,
+)
 from oracle_knowledge.validation import (
     ValidationReport,
     render_validation_report,
     validate_environment,
     validate_graph_directory,
+    validate_index_bundle,
     validate_index_database,
     validate_module_directory,
     validate_search_result,
@@ -203,6 +213,23 @@ def build_parser() -> argparse.ArgumentParser:
     federated.add_argument("--limit", type=int, default=20)
     federated.add_argument("--max-characters", type=int, default=14000)
     federated.add_argument(
+        "--index",
+        help=(
+            "Manifesto index_bundle.json, diretório search_index ou índice "
+            "SQLite legado. O padrão prioriza o bundle separado por camada."
+        ),
+    )
+    federated.add_argument(
+        "--no-index",
+        action="store_true",
+        help="Força o backend JSON para diagnóstico ou comparação.",
+    )
+    federated.add_argument(
+        "--require-index",
+        action="store_true",
+        help="Interrompe a busca se o índice SQLite não estiver disponível.",
+    )
+    federated.add_argument(
         "--module",
         action="append",
         default=[],
@@ -211,17 +238,77 @@ def build_parser() -> argparse.ArgumentParser:
 
     build_index = subparsers.add_parser(
         "build-index",
-        help="Constrói um índice SQLite + FTS5 a partir dos grafos separados.",
+        help=(
+            "Constrói índices SQLite + FTS5 independentes por camada, "
+            "com rebuild seletivo e reutilização de embeddings."
+        ),
     )
     build_index.add_argument("--graph-dir", required=True)
     build_index.add_argument(
         "--output",
         help=(
-            "Arquivo SQLite de saída. O padrão é "
-            "<graph-dir>/search_index/knowledge_index.sqlite."
+            "Arquivo SQLite monolítico legado. Quando informado, desativa "
+            "a geração do bundle separado por camada."
         ),
     )
+    build_index.add_argument(
+        "--output-dir",
+        help=(
+            "Diretório do bundle de índices. O padrão é "
+            "<graph-dir>/search_index."
+        ),
+    )
+    build_index.add_argument(
+        "--layer",
+        action="append",
+        choices=[
+            "business",
+            "physical",
+            "otbi_analytics",
+            "otbi_security",
+            "rest",
+            "master",
+        ],
+        default=[],
+        help=(
+            "Reconstrói somente a camada informada. Pode ser repetido. "
+            "Sem a opção, avalia todas as camadas e ignora as inalteradas."
+        ),
+    )
+    build_index.add_argument(
+        "--force",
+        action="store_true",
+        help="Reconstrói as camadas solicitadas mesmo quando o conteúdo não mudou.",
+    )
+    build_index.add_argument(
+        "--no-reuse-embeddings",
+        action="store_true",
+        help="Não reutiliza embeddings de índices anteriores durante o rebuild.",
+    )
     build_index.add_argument("--batch-size", type=int, default=1000)
+    build_index.add_argument(
+        "--skip-semantic-index",
+        action="store_true",
+        help=(
+            "Não gera embeddings persistentes das raízes. "
+            "Útil apenas para diagnóstico FTS5."
+        ),
+    )
+    build_index.add_argument(
+        "--semantic-model",
+        default=DEFAULT_EMBEDDING_MODEL,
+        help="Modelo sentence-transformers usado no índice semântico.",
+    )
+    build_index.add_argument(
+        "--semantic-device",
+        help="Dispositivo do sentence-transformers, por exemplo cpu ou cuda.",
+    )
+    build_index.add_argument(
+        "--semantic-batch-size",
+        type=int,
+        default=32,
+        help="Quantidade de raízes codificadas por lote.",
+    )
 
     validate_index = subparsers.add_parser(
         "validate-index",
@@ -231,8 +318,8 @@ def build_parser() -> argparse.ArgumentParser:
     validate_index.add_argument(
         "--index",
         help=(
-            "Arquivo SQLite a validar. O padrão é "
-            "<graph-dir>/search_index/knowledge_index.sqlite."
+            "Manifesto index_bundle.json ou índice SQLite legado. "
+            "O padrão prioriza o bundle separado por camada."
         ),
     )
     validate_index.add_argument(
@@ -697,24 +784,77 @@ def search_graph(args: argparse.Namespace) -> None:
 
 
 def search_federated_graphs(args: argparse.Namespace) -> None:
-    search = FederatedGraphSearch(args.graph_dir)
-    payload = search.build_prompt_context(
-        args.query,
-        limit=args.limit,
-        max_characters=args.max_characters,
-        module_ids=set(args.module) if args.module else None,
-    )
+    if args.no_index and args.require_index:
+        raise SystemExit("--no-index e --require-index não podem ser usados juntos.")
+
+    resolved_index = resolve_index_source(args.graph_dir, args.index)
+    if not args.no_index and not resolved_index.is_file() and not args.require_index:
+        print(
+            "[AVISO] Bundle de índices ou índice SQLite não encontrado; "
+            "usando backend JSON. Execute build-index.",
+            file=sys.stderr,
+        )
+
+    with FederatedGraphSearch(
+        args.graph_dir,
+        index_path=args.index,
+        use_index=not args.no_index,
+        require_index=args.require_index,
+        progress=lambda message: print(
+            message,
+            file=sys.stderr,
+            flush=True,
+        ),
+    ) as search:
+        payload = search.build_prompt_context(
+            args.query,
+            limit=args.limit,
+            max_characters=args.max_characters,
+            module_ids=set(args.module) if args.module else None,
+        )
     print(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
 def run_build_index(args: argparse.Namespace) -> None:
-    output_path = Path(args.output).resolve() if args.output else default_index_path(args.graph_dir)
-    result = build_search_index(
-        args.graph_dir,
-        output_path,
-        batch_size=args.batch_size,
-        progress=lambda message: print(message, file=sys.stderr, flush=True),
-    )
+    if args.output and args.output_dir:
+        raise SystemExit("--output e --output-dir não podem ser usados juntos.")
+    if args.output and args.layer:
+        raise SystemExit("--layer não pode ser usado com o índice monolítico --output.")
+
+    semantic_selector = None
+    if not args.skip_semantic_index:
+        semantic_selector = SemanticTextSelector(
+            SemanticContextConfig(
+                model_name=args.semantic_model,
+                device=args.semantic_device,
+                batch_size=args.semantic_batch_size,
+            )
+        )
+
+    progress = lambda message: print(message, file=sys.stderr, flush=True)
+    if args.output:
+        result = build_search_index(
+            args.graph_dir,
+            Path(args.output).resolve(),
+            batch_size=args.batch_size,
+            include_semantic_embeddings=not args.skip_semantic_index,
+            semantic_text_selector=semantic_selector,
+            semantic_batch_size=args.semantic_batch_size,
+            progress=progress,
+        )
+    else:
+        result = build_index_bundle(
+            args.graph_dir,
+            layers=args.layer or None,
+            output_dir=args.output_dir,
+            batch_size=args.batch_size,
+            include_semantic_embeddings=not args.skip_semantic_index,
+            semantic_text_selector=semantic_selector,
+            semantic_batch_size=args.semantic_batch_size,
+            progress=progress,
+            force=args.force,
+            reuse_embeddings=not args.no_reuse_embeddings,
+        )
     print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
 
 
@@ -751,15 +891,20 @@ def run_validate_module(args: argparse.Namespace) -> None:
 
 
 def run_validate_index(args: argparse.Namespace) -> None:
-    index_path = Path(args.index).resolve() if args.index else default_index_path(args.graph_dir)
-    _emit_validation_report(
-        validate_index_database(
+    index_path = resolve_index_source(args.graph_dir, args.index)
+    if index_path.suffix.casefold() == ".json":
+        report = validate_index_bundle(
             index_path,
             graph_dir=args.graph_dir,
             full_hash=args.full_hash,
-        ),
-        args.json_output,
-    )
+        )
+    else:
+        report = validate_index_database(
+            index_path,
+            graph_dir=args.graph_dir,
+            full_hash=args.full_hash,
+        )
+    _emit_validation_report(report, args.json_output)
 
 
 def run_validate_graph(args: argparse.Namespace) -> None:

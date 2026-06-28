@@ -1395,3 +1395,147 @@ python build_knowledge_base.py search-federated --help
 
 & ".\.venv\Scripts\python.exe" build_knowledge_base.py search-federated --help
 ```
+
+---
+
+## 22. Índices independentes por camada
+
+A busca federada usa, por padrão, um bundle de índices SQLite independentes:
+
+```text
+data/graph/<bundle>/search_index/
+├── index_bundle.json
+├── business.sqlite
+├── physical.sqlite
+├── otbi_analytics.sqlite
+├── otbi_security.sqlite
+├── rest.sqlite
+└── master.sqlite
+```
+
+O `index_bundle.json` associa cada camada ao arquivo SQLite correspondente. As ligações entre o master e os índices especializados continuam usando os IDs estáveis dos nós.
+
+### 22.1 Migração inicial do índice monolítico
+
+A primeira execução cria os arquivos separados. Quando o índice legado `knowledge_index.sqlite` existe, os embeddings compatíveis são reutilizados. Assim, a migração não precisa recalcular os vetores de todas as tabelas, subject areas e recursos REST.
+
+#### Bash
+
+```bash
+python -u build_knowledge_base.py build-index \
+  --graph-dir "./data/graph/scm" \
+  2>&1 | tee "./build_index_scm_bundle.log"
+```
+
+#### PowerShell
+
+```powershell
+& ".\.venv\Scripts\python.exe" -u build_knowledge_base.py build-index `
+  --graph-dir ".\data\graph\scm" `
+  2>&1 |
+  Tee-Object -FilePath ".\build_index_scm_bundle.log"
+```
+
+O log informa, por camada, quantos embeddings foram reutilizados e quantos precisaram ser gerados.
+
+### 22.2 Rebuild seletivo
+
+Uma alteração de aliases, entidades de negócio ou rotas curadas normalmente exige reconstruir apenas `master` e, quando aplicável, `business`:
+
+#### Bash
+
+```bash
+python -u build_knowledge_base.py build-index \
+  --graph-dir "./data/graph/scm" \
+  --layer master \
+  --layer business
+```
+
+#### PowerShell
+
+```powershell
+& ".\.venv\Scripts\python.exe" -u build_knowledge_base.py build-index `
+  --graph-dir ".\data\graph\scm" `
+  --layer master `
+  --layer business
+```
+
+Exemplos de escopo:
+
+| Alteração | Camada a reconstruir |
+|---|---|
+| Alias em português ou inglês | `master`, e possivelmente `business` |
+| Nova rota curada para uma tabela já existente | `master` |
+| Nova tabela, coluna, PK ou FK | `physical` |
+| Atualização de subject areas | `otbi_analytics` |
+| Atualização de roles OTBI | `otbi_security` |
+| Atualização de recursos ou operações REST | `rest` |
+| Mudança apenas de ranking ou prompt | nenhuma |
+
+Sem `--layer`, o comando verifica todas as camadas por SHA-256 e ignora automaticamente as que não mudaram.
+
+Dentro de uma camada modificada, embeddings cujo `content_hash` permaneceu igual são copiados do índice anterior. Somente nós novos ou alterados são enviados ao modelo semântico.
+
+### 22.3 Forçar reconstrução
+
+Use somente para diagnóstico ou alteração deliberada do índice:
+
+#### Bash
+
+```bash
+python build_knowledge_base.py build-index \
+  --graph-dir "./data/graph/scm" \
+  --layer physical \
+  --force
+```
+
+#### PowerShell
+
+```powershell
+& ".\.venv\Scripts\python.exe" build_knowledge_base.py build-index `
+  --graph-dir ".\data\graph\scm" `
+  --layer physical `
+  --force
+```
+
+Para impedir a reutilização de vetores antigos, acrescente `--no-reuse-embeddings`.
+
+### 22.4 Validar o bundle
+
+#### Bash
+
+```bash
+python build_knowledge_base.py validate-index \
+  --graph-dir "./data/graph/scm"
+```
+
+#### PowerShell
+
+```powershell
+& ".\.venv\Scripts\python.exe" build_knowledge_base.py validate-index `
+  --graph-dir ".\data\graph\scm"
+```
+
+A validação confere o manifesto, a associação camada/arquivo, integridade SQLite, FTS5, cobertura semântica, contagens e atualização em relação a cada grafo.
+
+### 22.5 Busca
+
+`search-federated` prioriza automaticamente `index_bundle.json`. O bloco `routing` informa:
+
+```json
+{
+  "backend": "sqlite_bundle",
+  "index_path": ".../search_index/index_bundle.json",
+  "index_paths": {
+    "physical": ".../search_index/physical.sqlite",
+    "otbi_analytics": ".../search_index/otbi_analytics.sqlite",
+    "rest": ".../search_index/rest.sqlite"
+  }
+}
+```
+
+O parâmetro `--index` também aceita o caminho do `index_bundle.json`, o diretório `search_index` ou um SQLite monolítico legado.
+
+### 22.6 GPU
+
+GPU NVIDIA com CUDA é recomendada para a primeira geração de muitos embeddings ou para alterações em massa, mas não é obrigatória. Rebuild seletivo e reutilização por `content_hash` evitam recalcular todo o módulo em atualizações comuns de curadoria.

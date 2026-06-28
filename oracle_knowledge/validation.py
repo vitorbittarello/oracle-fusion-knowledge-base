@@ -16,11 +16,16 @@ from oracle_knowledge.linker.graph_layers import (
     MASTER_EDGE_TYPES,
 )
 from oracle_knowledge.indexing import (
+    INDEX_BUNDLE_VERSION,
     INDEX_SCHEMA_VERSION,
     INDEX_USER_VERSION,
     REQUIRED_SQL_INDEXES,
+    SEMANTIC_ROOT_TYPES,
+    SUPPORTED_INDEX_SCHEMA_VERSIONS,
+    default_index_bundle_path,
     default_index_path,
     file_sha256,
+    read_index_bundle,
     read_index_metadata,
 )
 
@@ -850,6 +855,26 @@ def validate_graph_directory(graph_dir: str | Path) -> ValidationReport:
     return report
 
 
+def _eligible_semantic_root_count(
+    connection: sqlite3.Connection,
+) -> int:
+    total = 0
+    for layer, node_types in SEMANTIC_ROOT_TYPES.items():
+        placeholders = ",".join("?" for _ in node_types)
+        total += int(
+            connection.execute(
+                f"""
+                SELECT COUNT(*)
+                  FROM nodes
+                 WHERE graph_layer = ?
+                   AND node_type IN ({placeholders})
+                """,
+                [layer, *sorted(node_types)],
+            ).fetchone()[0]
+        )
+    return total
+
+
 def validate_index_database(
     index_path: str | Path | None = None,
     *,
@@ -879,18 +904,10 @@ def validate_index_database(
             )
 
     if not path.exists():
-        report.error(
-            "INDEX_FILE_MISSING",
-            "Índice SQLite não encontrado.",
-            path=path,
-        )
+        report.error("INDEX_FILE_MISSING", "Índice SQLite não encontrado.", path=path)
         return report
     if not path.is_file():
-        report.error(
-            "INDEX_FILE_INVALID",
-            "O caminho do índice não é um arquivo.",
-            path=path,
-        )
+        report.error("INDEX_FILE_INVALID", "O caminho do índice não é um arquivo.", path=path)
         return report
 
     report.ok(
@@ -914,11 +931,7 @@ def validate_index_database(
         integrity = connection.execute("PRAGMA integrity_check").fetchone()
         integrity_value = str(integrity[0]) if integrity else "unknown"
         if integrity_value == "ok":
-            report.ok(
-                "INDEX_INTEGRITY",
-                "PRAGMA integrity_check retornou ok.",
-                path=path,
-            )
+            report.ok("INDEX_INTEGRITY", "PRAGMA integrity_check retornou ok.", path=path)
         else:
             report.error(
                 "INDEX_INTEGRITY",
@@ -940,6 +953,7 @@ def validate_index_database(
             "node_modules",
             "edges",
             "nodes_fts",
+            "semantic_roots",
         }
         missing_tables = sorted(required_tables - tables)
         if missing_tables:
@@ -957,16 +971,23 @@ def validate_index_database(
         )
 
         metadata = read_index_metadata(connection)
-        schema_version = metadata.get("schema_version")
-        if schema_version != INDEX_SCHEMA_VERSION:
+        schema_version = str(metadata.get("schema_version") or "")
+        if schema_version not in SUPPORTED_INDEX_SCHEMA_VERSIONS:
             report.error(
                 "INDEX_SCHEMA_VERSION",
                 "Versão do esquema do índice incompatível.",
                 path=path,
                 details={
-                    "expected": INDEX_SCHEMA_VERSION,
+                    "accepted": sorted(SUPPORTED_INDEX_SCHEMA_VERSIONS),
                     "actual": schema_version,
                 },
+            )
+        elif schema_version != INDEX_SCHEMA_VERSION:
+            report.warning(
+                "INDEX_SCHEMA_VERSION",
+                "Índice legado compatível; recomenda-se migrar para o bundle por camada.",
+                path=path,
+                details={"current": INDEX_SCHEMA_VERSION, "actual": schema_version},
             )
         else:
             report.ok(
@@ -977,13 +998,14 @@ def validate_index_database(
             )
 
         user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        if user_version != INDEX_USER_VERSION:
+        accepted_user_versions = {2, INDEX_USER_VERSION}
+        if user_version not in accepted_user_versions:
             report.error(
                 "INDEX_USER_VERSION",
                 "PRAGMA user_version incompatível.",
                 path=path,
                 details={
-                    "expected": INDEX_USER_VERSION,
+                    "accepted": sorted(accepted_user_versions),
                     "actual": user_version,
                 },
             )
@@ -1020,19 +1042,16 @@ def validate_index_database(
         counts = {
             "nodes": int(connection.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]),
             "edges": int(connection.execute("SELECT COUNT(*) FROM edges").fetchone()[0]),
-            "node_modules": int(
-                connection.execute("SELECT COUNT(*) FROM node_modules").fetchone()[0]
-            ),
-            "nodes_fts": int(
-                connection.execute("SELECT COUNT(*) FROM nodes_fts").fetchone()[0]
-            ),
+            "node_modules": int(connection.execute("SELECT COUNT(*) FROM node_modules").fetchone()[0]),
+            "nodes_fts": int(connection.execute("SELECT COUNT(*) FROM nodes_fts").fetchone()[0]),
+            "semantic_roots": int(connection.execute("SELECT COUNT(*) FROM semantic_roots").fetchone()[0]),
         }
-
         declared_counts = {
             "nodes": metadata.get("node_count"),
             "edges": metadata.get("edge_count"),
             "node_modules": metadata.get("module_link_count"),
             "nodes_fts": metadata.get("fts_row_count"),
+            "semantic_roots": metadata.get("semantic_root_count"),
         }
         mismatches = {
             key: {"declared": declared_counts[key], "actual": actual}
@@ -1059,10 +1078,7 @@ def validate_index_database(
                 "INDEX_FTS_COVERAGE",
                 "A quantidade de linhas FTS5 difere da quantidade de nós.",
                 path=path,
-                details={
-                    "nodes": counts["nodes"],
-                    "fts_rows": counts["nodes_fts"],
-                },
+                details={"nodes": counts["nodes"], "fts_rows": counts["nodes_fts"]},
             )
         else:
             report.ok(
@@ -1070,6 +1086,61 @@ def validate_index_database(
                 "Todos os nós possuem uma linha no FTS5.",
                 path=path,
                 details={"count": counts["nodes_fts"]},
+            )
+
+        eligible_semantic_roots = _eligible_semantic_root_count(connection)
+        if counts["semantic_roots"] == eligible_semantic_roots:
+            report.ok(
+                "INDEX_SEMANTIC_ROOT_COVERAGE",
+                "Todas as raízes elegíveis possuem embedding persistente.",
+                path=path,
+                details={
+                    "eligible": eligible_semantic_roots,
+                    "indexed": counts["semantic_roots"],
+                    "dimensions": metadata.get("semantic_dimensions"),
+                    "model": metadata.get("semantic_model_name"),
+                    "reused": metadata.get("reused_semantic_root_count", 0),
+                    "generated": metadata.get("generated_semantic_root_count", 0),
+                },
+            )
+        elif counts["semantic_roots"] == 0:
+            report.warning(
+                "INDEX_SEMANTIC_ROOT_COVERAGE",
+                "O índice foi construído sem embeddings semânticos.",
+                path=path,
+                details={"eligible": eligible_semantic_roots},
+            )
+        else:
+            report.error(
+                "INDEX_SEMANTIC_ROOT_COVERAGE",
+                "A cobertura dos embeddings semânticos está incompleta.",
+                path=path,
+                details={"eligible": eligible_semantic_roots, "indexed": counts["semantic_roots"]},
+            )
+
+        invalid_semantic_vectors = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                  FROM semantic_roots
+                 WHERE dimensions <= 0
+                    OR length(embedding) != dimensions * 4
+                """
+            ).fetchone()[0]
+        )
+        if invalid_semantic_vectors:
+            report.error(
+                "INDEX_SEMANTIC_VECTOR_SHAPE",
+                "Existem embeddings com dimensão ou tamanho inválido.",
+                path=path,
+                details={"count": invalid_semantic_vectors},
+            )
+        else:
+            report.ok(
+                "INDEX_SEMANTIC_VECTOR_SHAPE",
+                "Os embeddings persistidos possuem tamanho consistente.",
+                path=path,
+                details={"count": counts["semantic_roots"]},
             )
 
         try:
@@ -1084,11 +1155,7 @@ def validate_index_database(
                 path=path,
             )
         else:
-            report.ok(
-                "INDEX_FTS_QUERY",
-                "O FTS5 executou uma consulta de validação.",
-                path=path,
-            )
+            report.ok("INDEX_FTS_QUERY", "O FTS5 executou uma consulta de validação.", path=path)
 
         orphan_edges = int(
             connection.execute(
@@ -1102,18 +1169,9 @@ def validate_index_database(
             ).fetchone()[0]
         )
         if orphan_edges:
-            report.error(
-                "INDEX_ORPHAN_EDGES",
-                "Existem arestas órfãs no índice.",
-                path=path,
-                details={"count": orphan_edges},
-            )
+            report.error("INDEX_ORPHAN_EDGES", "Existem arestas órfãs no índice.", path=path, details={"count": orphan_edges})
         else:
-            report.ok(
-                "INDEX_ORPHAN_EDGES",
-                "Nenhuma aresta órfã foi encontrada.",
-                path=path,
-            )
+            report.ok("INDEX_ORPHAN_EDGES", "Nenhuma aresta órfã foi encontrada.", path=path)
 
         orphan_modules = int(
             connection.execute(
@@ -1126,62 +1184,9 @@ def validate_index_database(
             ).fetchone()[0]
         )
         if orphan_modules:
-            report.error(
-                "INDEX_ORPHAN_MODULES",
-                "Existem vínculos de módulo órfãos no índice.",
-                path=path,
-                details={"count": orphan_modules},
-            )
+            report.error("INDEX_ORPHAN_MODULES", "Existem vínculos de módulo órfãos no índice.", path=path, details={"count": orphan_modules})
         else:
-            report.ok(
-                "INDEX_ORPHAN_MODULES",
-                "Nenhum vínculo de módulo órfão foi encontrado.",
-                path=path,
-            )
-
-        bundle_metadata = metadata.get("graph_bundle")
-        if not isinstance(bundle_metadata, dict):
-            report.error(
-                "INDEX_BUNDLE_METADATA",
-                "O índice não contém metadados do graph_bundle.json.",
-                path=path,
-            )
-        else:
-            bundle_source = (
-                graph_root / "graph_bundle.json"
-                if graph_root is not None
-                else Path(str(bundle_metadata.get("path") or ""))
-            )
-            if not bundle_source.is_file():
-                report.error(
-                    "INDEX_BUNDLE_SOURCE",
-                    "graph_bundle.json usado na construção não foi encontrado.",
-                    path=bundle_source,
-                )
-            else:
-                bundle_stat = bundle_source.stat()
-                bundle_stale = (
-                    bundle_stat.st_size != int(bundle_metadata.get("size_bytes") or -1)
-                    or bundle_stat.st_mtime_ns != int(bundle_metadata.get("modified_ns") or -1)
-                )
-                if not bundle_stale and full_hash:
-                    bundle_stale = (
-                        file_sha256(bundle_source)
-                        != str(bundle_metadata.get("sha256") or "")
-                    )
-                if bundle_stale:
-                    report.error(
-                        "INDEX_BUNDLE_STALE",
-                        "O índice está desatualizado em relação ao graph_bundle.json.",
-                        path=bundle_source,
-                    )
-                else:
-                    report.ok(
-                        "INDEX_BUNDLE_FRESHNESS",
-                        "O graph_bundle.json corresponde ao índice.",
-                        path=bundle_source,
-                        details={"full_hash": full_hash},
-                    )
+            report.ok("INDEX_ORPHAN_MODULES", "Nenhum vínculo de módulo órfão foi encontrado.", path=path)
 
         graph_rows = connection.execute(
             """
@@ -1191,82 +1196,47 @@ def validate_index_database(
           ORDER BY graph_layer
             """
         ).fetchall()
-        if len(graph_rows) != len(GRAPH_FILENAMES):
+        indexed_layers = metadata.get("indexed_layers")
+        if not isinstance(indexed_layers, list) or not indexed_layers:
+            indexed_layers = [str(row[0]) for row in graph_rows]
+        expected_layers = tuple(str(layer) for layer in indexed_layers)
+        if len(graph_rows) != len(expected_layers):
             report.error(
                 "INDEX_GRAPH_FILE_COUNT",
                 "A quantidade de grafos indexados é incompatível.",
                 path=path,
-                details={
-                    "expected": len(GRAPH_FILENAMES),
-                    "actual": len(graph_rows),
-                },
+                details={"expected": len(expected_layers), "actual": len(graph_rows)},
             )
         else:
             report.ok(
                 "INDEX_GRAPH_FILE_COUNT",
-                "Todos os grafos esperados estão registrados no índice.",
+                "Todos os grafos declarados estão registrados no índice.",
                 path=path,
-                details={"count": len(graph_rows)},
+                details={"layers": list(expected_layers)},
             )
 
         stale_files: list[dict[str, Any]] = []
-        missing_files: list[str] = []
+        metadata_only_changes: list[dict[str, Any]] = []
         count_mismatches: list[dict[str, Any]] = []
-        for (
-            layer,
-            filename,
-            source_path,
-            size_bytes,
-            modified_ns,
-            stored_hash,
-            declared_nodes,
-            declared_edges,
-        ) in graph_rows:
-            expected_filename = GRAPH_FILENAMES.get(str(layer))
+        for layer, filename, source_path, size_bytes, modified_ns, stored_hash, declared_nodes, declared_edges in graph_rows:
+            layer = str(layer)
+            expected_filename = GRAPH_FILENAMES.get(layer)
             if expected_filename != filename:
-                stale_files.append(
-                    {
-                        "layer": layer,
-                        "reason": "filename",
-                        "expected": expected_filename,
-                        "actual": filename,
-                    }
-                )
-
-            source = (
-                graph_root / str(filename)
-                if graph_root is not None
-                else Path(str(source_path))
-            )
-            if not source.is_file():
-                missing_files.append(str(source))
+                stale_files.append({"layer": layer, "reason": "filename", "expected": expected_filename, "actual": filename})
                 continue
-
+            source = graph_root / str(filename) if graph_root is not None else Path(str(source_path))
+            if not source.is_file():
+                stale_files.append({"layer": layer, "reason": "missing", "path": str(source)})
+                continue
             stat = source.stat()
-            if stat.st_size != int(size_bytes) or stat.st_mtime_ns != int(modified_ns):
-                stale_files.append(
-                    {
-                        "layer": layer,
-                        "reason": "size_or_modified_time",
-                        "path": str(source),
-                        "stored_size": int(size_bytes),
-                        "current_size": stat.st_size,
-                        "stored_modified_ns": int(modified_ns),
-                        "current_modified_ns": stat.st_mtime_ns,
-                    }
-                )
-            elif full_hash:
+            metadata_changed = stat.st_size != int(size_bytes) or stat.st_mtime_ns != int(modified_ns)
+            current_hash: str | None = None
+            if metadata_changed or full_hash:
                 current_hash = file_sha256(source)
-                if current_hash != stored_hash:
-                    stale_files.append(
-                        {
-                            "layer": layer,
-                            "reason": "sha256",
-                            "path": str(source),
-                            "stored": stored_hash,
-                            "current": current_hash,
-                        }
-                    )
+            if current_hash is not None and current_hash != str(stored_hash):
+                stale_files.append({"layer": layer, "reason": "sha256", "path": str(source), "stored": stored_hash, "current": current_hash})
+            elif metadata_changed:
+                metadata_only_changes.append({"layer": layer, "path": str(source)})
 
             database_counts = connection.execute(
                 """
@@ -1276,28 +1246,46 @@ def validate_index_database(
                 """,
                 (layer, layer),
             ).fetchone()
-            if (
-                int(database_counts[0]) != int(declared_nodes)
-                or int(database_counts[1]) != int(declared_edges)
-            ):
-                count_mismatches.append(
-                    {
-                        "layer": layer,
-                        "declared_nodes": int(declared_nodes),
-                        "actual_nodes": int(database_counts[0]),
-                        "declared_edges": int(declared_edges),
-                        "actual_edges": int(database_counts[1]),
-                    }
-                )
+            if int(database_counts[0]) != int(declared_nodes) or int(database_counts[1]) != int(declared_edges):
+                count_mismatches.append({
+                    "layer": layer,
+                    "declared_nodes": int(declared_nodes),
+                    "actual_nodes": int(database_counts[0]),
+                    "declared_edges": int(declared_edges),
+                    "actual_edges": int(database_counts[1]),
+                })
 
-        if missing_files:
-            report.error(
-                "INDEX_SOURCE_FILES_MISSING",
-                "Existem grafos de origem ausentes.",
+        if metadata_only_changes:
+            report.warning(
+                "INDEX_SOURCE_METADATA_CHANGED",
+                "Datas ou tamanhos mudaram, mas o SHA-256 confirma conteúdo idêntico.",
                 path=path,
-                details={"files": missing_files},
+                details={"files": metadata_only_changes},
             )
-        elif stale_files:
+        if count_mismatches:
+            report.error(
+                "INDEX_GRAPH_COUNTS",
+                "As contagens por camada divergem do registro graph_files.",
+                path=path,
+                details={"mismatches": count_mismatches},
+            )
+        else:
+            report.ok("INDEX_GRAPH_COUNTS", "As contagens por camada estão consistentes.", path=path)
+
+        index_mode = str(metadata.get("index_mode") or "monolithic")
+        bundle_metadata = metadata.get("graph_bundle")
+        if index_mode == "monolithic" and isinstance(bundle_metadata, dict):
+            bundle_source = graph_root / "graph_bundle.json" if graph_root is not None else Path(str(bundle_metadata.get("path") or ""))
+            if not bundle_source.is_file():
+                stale_files.append({"reason": "graph_bundle_missing", "path": str(bundle_source)})
+            else:
+                stat = bundle_source.stat()
+                changed = stat.st_size != int(bundle_metadata.get("size_bytes") or -1) or stat.st_mtime_ns != int(bundle_metadata.get("modified_ns") or -1)
+                current_hash = file_sha256(bundle_source) if changed or full_hash else None
+                if current_hash is not None and current_hash != str(bundle_metadata.get("sha256") or ""):
+                    stale_files.append({"reason": "graph_bundle_sha256", "path": str(bundle_source)})
+
+        if stale_files:
             report.error(
                 "INDEX_STALE",
                 "O índice está desatualizado em relação aos grafos de origem.",
@@ -1307,41 +1295,144 @@ def validate_index_database(
         else:
             report.ok(
                 "INDEX_FRESHNESS",
-                "O índice corresponde aos arquivos de grafo atuais.",
+                "Os grafos de origem correspondem ao conteúdo indexado.",
                 path=path,
                 details={"full_hash": full_hash},
             )
 
-        if count_mismatches:
-            report.error(
-                "INDEX_LAYER_COUNTS",
-                "As contagens por camada estão inconsistentes.",
-                path=path,
-                details={"layers": count_mismatches},
-            )
-        else:
-            report.ok(
-                "INDEX_LAYER_COUNTS",
-                "As contagens por camada estão consistentes.",
-                path=path,
-            )
-
         report.metadata = {
-            "index_path": str(path),
-            "graph_dir": str(graph_root) if graph_root is not None else metadata.get("graph_dir"),
             "schema_version": schema_version,
+            "index_mode": index_mode,
+            "indexed_layers": list(expected_layers),
             "counts": counts,
-            "full_hash": full_hash,
+            "semantic_model_name": metadata.get("semantic_model_name"),
+            "semantic_dimensions": metadata.get("semantic_dimensions"),
         }
-    except sqlite3.DatabaseError as exc:
-        report.error(
-            "INDEX_DATABASE_ERROR",
-            f"Falha ao validar o banco SQLite: {exc}",
-            path=path,
-        )
     finally:
         connection.close()
 
+    return report
+
+
+def validate_index_bundle(
+    bundle_path: str | Path | None = None,
+    *,
+    graph_dir: str | Path | None = None,
+    full_hash: bool = False,
+) -> ValidationReport:
+    graph_root = Path(graph_dir).resolve() if graph_dir is not None else Path(".").resolve()
+    path = (
+        Path(bundle_path).resolve()
+        if bundle_path is not None
+        else default_index_bundle_path(graph_root)
+    )
+    report = ValidationReport("index_bundle", str(path))
+
+    if not path.is_file():
+        report.error("INDEX_BUNDLE_MISSING", "Manifesto index_bundle.json não encontrado.", path=path)
+        return report
+    try:
+        payload = read_index_bundle(path)
+    except ValueError as exc:
+        report.error("INDEX_BUNDLE_INVALID", str(exc), path=path)
+        return report
+
+    if payload.get("version") != INDEX_BUNDLE_VERSION:
+        report.error(
+            "INDEX_BUNDLE_VERSION",
+            "Versão do manifesto de índices incompatível.",
+            path=path,
+            details={"expected": INDEX_BUNDLE_VERSION, "actual": payload.get("version")},
+        )
+    else:
+        report.ok("INDEX_BUNDLE_VERSION", "Versão do manifesto de índices compatível.", path=path)
+
+    indexes = payload.get("indexes")
+    if not isinstance(indexes, dict):
+        report.error("INDEX_BUNDLE_STRUCTURE", "O manifesto não contém o objeto indexes.", path=path)
+        return report
+
+    missing_layers = sorted(set(GRAPH_FILENAMES) - set(indexes))
+    if missing_layers:
+        report.error(
+            "INDEX_BUNDLE_LAYERS",
+            "O bundle não contém índices para todas as camadas.",
+            path=path,
+            details={"missing": missing_layers},
+        )
+    else:
+        report.ok(
+            "INDEX_BUNDLE_LAYERS",
+            "O bundle contém índices para todas as camadas.",
+            path=path,
+            details={"layers": list(GRAPH_FILENAMES)},
+        )
+
+    bundle_graph_metadata = payload.get("graph_bundle")
+    if isinstance(bundle_graph_metadata, dict):
+        graph_bundle_path = graph_root / "graph_bundle.json"
+        if not graph_bundle_path.is_file():
+            report.error("INDEX_BUNDLE_GRAPH_SOURCE", "graph_bundle.json não encontrado.", path=graph_bundle_path)
+        else:
+            current_hash = file_sha256(graph_bundle_path)
+            if current_hash != str(bundle_graph_metadata.get("sha256") or ""):
+                report.error(
+                    "INDEX_BUNDLE_GRAPH_STALE",
+                    "O manifesto de índices está desatualizado em relação ao graph_bundle.json.",
+                    path=graph_bundle_path,
+                )
+            else:
+                report.ok("INDEX_BUNDLE_GRAPH_FRESHNESS", "graph_bundle.json corresponde ao manifesto.", path=graph_bundle_path)
+
+    validated_layers: list[str] = []
+    for layer in GRAPH_FILENAMES:
+        entry = indexes.get(layer)
+        if not isinstance(entry, dict):
+            continue
+        raw_path = Path(str(entry.get("path") or ""))
+        index_file = raw_path.resolve() if raw_path.is_absolute() else (path.parent / raw_path).resolve()
+        child = validate_index_database(
+            index_file,
+            graph_dir=graph_root,
+            full_hash=full_hash,
+        )
+        for check in child.checks:
+            details = {"layer": layer, **check.details}
+            report.add(
+                check.status,
+                f"{layer.upper()}_{check.code}",
+                check.message,
+                path=check.path,
+                details=details,
+            )
+        child_layers = child.metadata.get("indexed_layers") or []
+        if child_layers != [layer]:
+            report.error(
+                "INDEX_BUNDLE_LAYER_ASSOCIATION",
+                "O arquivo SQLite não está associado exclusivamente à camada declarada.",
+                path=index_file,
+                details={"declared_layer": layer, "indexed_layers": child_layers},
+            )
+        else:
+            validated_layers.append(layer)
+
+        graph_path = graph_root / GRAPH_FILENAMES[layer]
+        if graph_path.is_file():
+            current_hash = file_sha256(graph_path) if full_hash or graph_path.stat().st_mtime_ns != int(entry.get("graph_modified_ns") or -1) else str(entry.get("graph_sha256") or "")
+            if current_hash != str(entry.get("graph_sha256") or ""):
+                report.error(
+                    "INDEX_BUNDLE_LAYER_STALE",
+                    "A camada do manifesto está desatualizada em relação ao grafo.",
+                    path=graph_path,
+                    details={"layer": layer},
+                )
+
+    report.metadata = {
+        "bundle_version": payload.get("version"),
+        "schema_version": payload.get("schema_version"),
+        "validated_layers": validated_layers,
+        "index_count": len(indexes),
+    }
     return report
 
 

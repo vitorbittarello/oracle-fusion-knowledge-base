@@ -4,16 +4,30 @@ import hashlib
 import json
 import os
 import sqlite3
+
+import numpy as np
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable, Sequence
 
 from oracle_knowledge.common import utc_now_iso
 from oracle_knowledge.linker.graph_layers import GRAPH_FILENAMES
+from oracle_knowledge.search.semantic_context import (
+    DEFAULT_EMBEDDING_MODEL,
+    SemanticTextSelector,
+)
 
-INDEX_SCHEMA_VERSION = "1.0.0"
-INDEX_USER_VERSION = 1
-DEFAULT_INDEX_RELATIVE_PATH = Path("search_index") / "knowledge_index.sqlite"
+INDEX_SCHEMA_VERSION = "3.0.0"
+INDEX_USER_VERSION = 3
+SUPPORTED_INDEX_SCHEMA_VERSIONS = {"2.0.0", INDEX_SCHEMA_VERSION}
+INDEX_BUNDLE_VERSION = "1.0.0"
+DEFAULT_INDEX_DIRECTORY_RELATIVE_PATH = Path("search_index")
+DEFAULT_INDEX_RELATIVE_PATH = DEFAULT_INDEX_DIRECTORY_RELATIVE_PATH / "knowledge_index.sqlite"
+DEFAULT_INDEX_BUNDLE_RELATIVE_PATH = DEFAULT_INDEX_DIRECTORY_RELATIVE_PATH / "index_bundle.json"
+LAYER_INDEX_FILENAMES = {
+    layer: f"{layer}.sqlite"
+    for layer in GRAPH_FILENAMES
+}
 
 REQUIRED_SQL_INDEXES = {
     "idx_nodes_layer_type",
@@ -23,6 +37,7 @@ REQUIRED_SQL_INDEXES = {
     "idx_edges_source",
     "idx_edges_target",
     "idx_edges_type",
+    "idx_semantic_roots_model",
 }
 
 
@@ -63,6 +78,12 @@ class IndexBuildResult:
     edge_count: int
     fts_row_count: int
     module_link_count: int
+    semantic_root_count: int
+    semantic_dimensions: int | None
+    semantic_model_name: str | None
+    indexed_layers: tuple[str, ...] = ()
+    reused_semantic_root_count: int = 0
+    generated_semantic_root_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -74,11 +95,81 @@ class IndexBuildResult:
             "edge_count": self.edge_count,
             "fts_row_count": self.fts_row_count,
             "module_link_count": self.module_link_count,
+            "semantic_root_count": self.semantic_root_count,
+            "semantic_dimensions": self.semantic_dimensions,
+            "semantic_model_name": self.semantic_model_name,
+            "indexed_layers": list(self.indexed_layers),
+            "reused_semantic_root_count": self.reused_semantic_root_count,
+            "generated_semantic_root_count": self.generated_semantic_root_count,
+        }
+
+
+@dataclass(frozen=True)
+class IndexBundleBuildResult:
+    graph_dir: Path
+    bundle_path: Path
+    requested_layers: tuple[str, ...]
+    built_layers: tuple[str, ...]
+    skipped_layers: tuple[str, ...]
+    indexes: dict[str, dict[str, Any]]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "graph_dir": str(self.graph_dir),
+            "bundle_path": str(self.bundle_path),
+            "bundle_version": INDEX_BUNDLE_VERSION,
+            "schema_version": INDEX_SCHEMA_VERSION,
+            "requested_layers": list(self.requested_layers),
+            "built_layers": list(self.built_layers),
+            "skipped_layers": list(self.skipped_layers),
+            "indexes": self.indexes,
         }
 
 
 def default_index_path(graph_dir: str | Path) -> Path:
+    """Caminho legado do índice monolítico."""
     return Path(graph_dir).resolve() / DEFAULT_INDEX_RELATIVE_PATH
+
+
+def default_index_bundle_path(graph_dir: str | Path) -> Path:
+    return Path(graph_dir).resolve() / DEFAULT_INDEX_BUNDLE_RELATIVE_PATH
+
+
+def default_layer_index_path(graph_dir: str | Path, layer: str) -> Path:
+    if layer not in LAYER_INDEX_FILENAMES:
+        raise ValueError(f"Camada de índice desconhecida: {layer}")
+    return (
+        Path(graph_dir).resolve()
+        / DEFAULT_INDEX_DIRECTORY_RELATIVE_PATH
+        / LAYER_INDEX_FILENAMES[layer]
+    )
+
+
+def resolve_index_source(
+    graph_dir: str | Path,
+    index_path: str | Path | None = None,
+) -> Path:
+    if index_path is not None:
+        candidate = Path(index_path).resolve()
+        if candidate.is_dir():
+            return candidate / "index_bundle.json"
+        return candidate
+    bundle_path = default_index_bundle_path(graph_dir)
+    if bundle_path.is_file():
+        return bundle_path
+    return default_index_path(graph_dir)
+
+
+def read_index_bundle(path: str | Path) -> dict[str, Any]:
+    bundle_path = Path(path).resolve()
+    try:
+        with bundle_path.open("r", encoding="utf-8-sig") as file:
+            payload = json.load(file)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Manifesto de índices inválido ou ilegível: {bundle_path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"O manifesto de índices deve ser um objeto JSON: {bundle_path}")
+    return payload
 
 
 def _compact_json(value: Any) -> str:
@@ -125,7 +216,7 @@ def _configure_build_connection(connection: sqlite3.Connection) -> None:
 def _create_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
-        PRAGMA user_version = 1;
+        PRAGMA user_version = 3;
 
         CREATE TABLE index_metadata (
             key TEXT PRIMARY KEY,
@@ -194,6 +285,14 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             tokenize = 'unicode61 remove_diacritics 2'
         );
 
+        CREATE TABLE semantic_roots (
+            node_pk INTEGER PRIMARY KEY,
+            model_name TEXT NOT NULL,
+            dimensions INTEGER NOT NULL,
+            embedding BLOB NOT NULL,
+            FOREIGN KEY (node_pk) REFERENCES nodes(node_pk) ON DELETE CASCADE
+        ) WITHOUT ROWID;
+
         CREATE INDEX idx_nodes_layer_type
             ON nodes(graph_layer, node_type);
         CREATE INDEX idx_nodes_layer_title
@@ -209,6 +308,8 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             ON edges(graph_layer, target_node_pk, edge_type);
         CREATE INDEX idx_edges_type
             ON edges(graph_layer, edge_type);
+        CREATE INDEX idx_semantic_roots_model
+            ON semantic_roots(model_name, dimensions);
         """
     )
 
@@ -498,26 +599,212 @@ def _insert_graph(
     )
 
 
-def build_search_index(
-    graph_dir: str | Path,
-    output_path: str | Path | None = None,
+SEMANTIC_ROOT_TYPES = {
+    "master": {"business_entity", "business_attribute", "validated_rule"},
+    "physical": {"physical_table"},
+    "otbi_analytics": {"otbi_subject_area"},
+    "rest": {"rest_resource"},
+}
+
+
+def _semantic_root_text(row: sqlite3.Row) -> str:
+    return "\n".join(
+        value
+        for value in (
+            str(row["title"] or "").strip(),
+            str(row["qualified_name"] or "").strip(),
+            str(row["search_text"] or "").strip(),
+            str(row["summary"] or "").strip(),
+        )
+        if value
+    )
+
+
+def _load_reusable_semantic_roots(
+    index_path: str | Path | None,
     *,
-    batch_size: int = 1000,
-    progress: Callable[[str], None] | None = None,
-) -> IndexBuildResult:
+    model_name: str,
+) -> dict[tuple[str, str, str], tuple[int, bytes]]:
+    if index_path is None:
+        return {}
+    path = Path(index_path).resolve()
+    if not path.is_file():
+        return {}
+
+    try:
+        connection = sqlite3.connect(
+            f"file:{path.as_posix()}?mode=ro",
+            uri=True,
+        )
+    except sqlite3.Error:
+        return {}
+
+    try:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if not {"nodes", "semantic_roots", "index_metadata"}.issubset(tables):
+            return {}
+        metadata = read_index_metadata(connection)
+        if metadata.get("schema_version") not in SUPPORTED_INDEX_SCHEMA_VERSIONS:
+            return {}
+
+        rows = connection.execute(
+            """
+            SELECT n.graph_layer,
+                   n.node_id,
+                   n.content_hash,
+                   s.dimensions,
+                   s.embedding
+              FROM semantic_roots s
+              JOIN nodes n ON n.node_pk = s.node_pk
+             WHERE s.model_name = ?
+            """,
+            (model_name,),
+        ).fetchall()
+        reusable: dict[tuple[str, str, str], tuple[int, bytes]] = {}
+        for layer, node_id, content_hash, dimensions, embedding in rows:
+            dimensions = int(dimensions)
+            payload = bytes(embedding)
+            if dimensions <= 0 or len(payload) != dimensions * 4:
+                continue
+            reusable[(str(layer), str(node_id), str(content_hash))] = (
+                dimensions,
+                payload,
+            )
+        return reusable
+    except sqlite3.Error:
+        return {}
+    finally:
+        connection.close()
+
+
+def _build_semantic_root_index(
+    connection: sqlite3.Connection,
+    selector: SemanticTextSelector,
+    *,
+    batch_size: int,
+    progress: Callable[[str], None] | None,
+    reusable_roots: dict[tuple[str, str, str], tuple[int, bytes]] | None = None,
+) -> tuple[int, int | None, str, int, int]:
     if batch_size <= 0:
-        raise ValueError("batch_size deve ser maior que zero")
+        raise ValueError("semantic_batch_size deve ser maior que zero")
 
-    graph_root = Path(graph_dir).resolve()
-    if not graph_root.is_dir():
-        raise FileNotFoundError(f"Diretório de grafos não encontrado: {graph_root}")
+    clauses: list[str] = []
+    parameters: list[str] = []
+    for layer, node_types in SEMANTIC_ROOT_TYPES.items():
+        placeholders = ",".join("?" for _ in node_types)
+        clauses.append(
+            f"(graph_layer = ? AND node_type IN ({placeholders}))"
+        )
+        parameters.extend([layer, *sorted(node_types)])
 
-    index_path = Path(output_path).resolve() if output_path else default_index_path(graph_root)
-    index_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = index_path.with_suffix(index_path.suffix + ".tmp")
-    if temporary_path.exists():
-        temporary_path.unlink()
+    connection.row_factory = sqlite3.Row
+    cursor = connection.execute(
+        f"""
+        SELECT node_pk, graph_layer, node_id, content_hash,
+               title, qualified_name, search_text, summary
+          FROM nodes
+         WHERE {' OR '.join(clauses)}
+         ORDER BY node_pk
+        """,
+        parameters,
+    )
 
+    model_name = selector.config.model_name or DEFAULT_EMBEDDING_MODEL
+    reusable = reusable_roots or {}
+    inserted = 0
+    reused_count = 0
+    generated_count = 0
+    dimensions: int | None = None
+
+    while rows := cursor.fetchmany(batch_size):
+        insert_rows: list[tuple[int, str, int, sqlite3.Binary]] = []
+        encode_rows: list[sqlite3.Row] = []
+        encode_documents: list[str] = []
+
+        for row in rows:
+            key = (
+                str(row["graph_layer"]),
+                str(row["node_id"]),
+                str(row["content_hash"]),
+            )
+            reused = reusable.get(key)
+            if reused is None:
+                encode_rows.append(row)
+                encode_documents.append(_semantic_root_text(row))
+                continue
+
+            reused_dimensions, reused_embedding = reused
+            if dimensions is None:
+                dimensions = reused_dimensions
+            elif dimensions != reused_dimensions:
+                encode_rows.append(row)
+                encode_documents.append(_semantic_root_text(row))
+                continue
+            insert_rows.append(
+                (
+                    int(row["node_pk"]),
+                    model_name,
+                    reused_dimensions,
+                    sqlite3.Binary(reused_embedding),
+                )
+            )
+            reused_count += 1
+
+        if encode_rows:
+            embeddings = selector.encode_documents(encode_documents)
+            if embeddings.shape[0] != len(encode_rows):
+                raise RuntimeError(
+                    "O modelo semântico devolveu quantidade incompatível de vetores."
+                )
+            current_dimensions = int(embeddings.shape[1]) if embeddings.ndim == 2 else 0
+            if current_dimensions <= 0:
+                raise RuntimeError("O modelo semântico devolveu vetores vazios.")
+            if dimensions is None:
+                dimensions = current_dimensions
+            elif dimensions != current_dimensions:
+                raise RuntimeError(
+                    "O modelo semântico alterou a dimensão dos vetores durante a indexação."
+                )
+
+            insert_rows.extend(
+                (
+                    int(row["node_pk"]),
+                    model_name,
+                    dimensions,
+                    sqlite3.Binary(
+                        np.asarray(vector, dtype="<f4").tobytes()
+                    ),
+                )
+                for row, vector in zip(encode_rows, embeddings, strict=True)
+            )
+            generated_count += len(encode_rows)
+
+        if insert_rows:
+            connection.executemany(
+                """
+                INSERT INTO semantic_roots (
+                    node_pk, model_name, dimensions, embedding
+                ) VALUES (?, ?, ?, ?)
+                """,
+                insert_rows,
+            )
+        inserted += len(rows)
+        if progress:
+            progress(
+                "[INDEX] Embeddings semânticos: "
+                f"{inserted} raízes processadas "
+                f"({reused_count} reutilizadas, {generated_count} geradas)."
+            )
+
+    return inserted, dimensions, model_name, reused_count, generated_count
+
+
+def _graph_bundle_info(graph_root: Path) -> dict[str, Any]:
     bundle_path = graph_root / "graph_bundle.json"
     if not bundle_path.is_file():
         raise FileNotFoundError(f"Manifesto do bundle não encontrado: {bundle_path}")
@@ -529,7 +816,7 @@ def build_search_index(
     if not isinstance(bundle_payload, dict):
         raise ValueError("graph_bundle.json deve conter um objeto JSON")
     bundle_stat = bundle_path.stat()
-    bundle_info = {
+    return {
         "path": str(bundle_path.resolve()),
         "size_bytes": bundle_stat.st_size,
         "modified_ns": bundle_stat.st_mtime_ns,
@@ -538,12 +825,57 @@ def build_search_index(
         "generated_at": bundle_payload.get("generated_at"),
     }
 
+
+def _normalize_layers(layers: Iterable[str] | None) -> tuple[str, ...]:
+    if layers is None:
+        return tuple(GRAPH_FILENAMES)
+    normalized = tuple(dict.fromkeys(str(layer).strip() for layer in layers if str(layer).strip()))
+    unknown = sorted(set(normalized) - set(GRAPH_FILENAMES))
+    if unknown:
+        raise ValueError(f"Camadas de índice desconhecidas: {', '.join(unknown)}")
+    if not normalized:
+        raise ValueError("Ao menos uma camada deve ser informada.")
+    return normalized
+
+
+def _build_index_for_layers(
+    graph_dir: str | Path,
+    output_path: str | Path,
+    *,
+    layers: Sequence[str],
+    index_mode: str,
+    batch_size: int,
+    include_semantic_embeddings: bool,
+    semantic_text_selector: SemanticTextSelector | None,
+    semantic_batch_size: int,
+    progress: Callable[[str], None] | None,
+    reuse_index_path: str | Path | None = None,
+) -> IndexBuildResult:
+    if batch_size <= 0:
+        raise ValueError("batch_size deve ser maior que zero")
+
+    graph_root = Path(graph_dir).resolve()
+    if not graph_root.is_dir():
+        raise FileNotFoundError(f"Diretório de grafos não encontrado: {graph_root}")
+
+    normalized_layers = _normalize_layers(layers)
+    index_path = Path(output_path).resolve()
+    index_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = index_path.with_suffix(index_path.suffix + ".tmp")
+    if temporary_path.exists():
+        temporary_path.unlink()
+
     graph_files: list[GraphFileInfo] = []
     total_nodes = 0
     total_edges = 0
     total_module_links = 0
     node_pk = 1
     edge_pk = 1
+    semantic_root_count = 0
+    semantic_dimensions: int | None = None
+    semantic_model_name: str | None = None
+    reused_semantic_root_count = 0
+    generated_semantic_root_count = 0
 
     connection = sqlite3.connect(temporary_path)
     try:
@@ -551,7 +883,8 @@ def build_search_index(
         _create_schema(connection)
 
         with connection:
-            for layer, filename in GRAPH_FILENAMES.items():
+            for layer in normalized_layers:
+                filename = GRAPH_FILENAMES[layer]
                 if progress:
                     progress(f"[INDEX] Processando {filename}...")
                 (
@@ -580,17 +913,55 @@ def build_search_index(
                         f"{edge_count} arestas."
                     )
 
-            metadata = {
+            if include_semantic_embeddings:
+                selector = semantic_text_selector or SemanticTextSelector()
+                model_name = selector.config.model_name or DEFAULT_EMBEDDING_MODEL
+                reusable_roots = _load_reusable_semantic_roots(
+                    reuse_index_path,
+                    model_name=model_name,
+                )
+                if progress:
+                    if reusable_roots:
+                        progress(
+                            "[INDEX] Construindo índice semântico das raízes "
+                            f"com {len(reusable_roots)} vetores reutilizáveis..."
+                        )
+                    else:
+                        progress("[INDEX] Construindo índice semântico das raízes...")
+                (
+                    semantic_root_count,
+                    semantic_dimensions,
+                    semantic_model_name,
+                    reused_semantic_root_count,
+                    generated_semantic_root_count,
+                ) = _build_semantic_root_index(
+                    connection,
+                    selector,
+                    batch_size=semantic_batch_size,
+                    progress=progress,
+                    reusable_roots=reusable_roots,
+                )
+
+            metadata: dict[str, Any] = {
                 "schema_version": INDEX_SCHEMA_VERSION,
                 "built_at": utc_now_iso(),
+                "index_mode": index_mode,
+                "indexed_layers": list(normalized_layers),
                 "graph_dir": str(graph_root),
                 "graph_file_count": len(graph_files),
-                "graph_bundle": bundle_info,
                 "node_count": total_nodes,
                 "edge_count": total_edges,
                 "fts_row_count": total_nodes,
                 "module_link_count": total_module_links,
+                "semantic_root_count": semantic_root_count,
+                "semantic_dimensions": semantic_dimensions,
+                "semantic_model_name": semantic_model_name,
+                "reused_semantic_root_count": reused_semantic_root_count,
+                "generated_semantic_root_count": generated_semantic_root_count,
             }
+            if index_mode == "monolithic":
+                metadata["graph_bundle"] = _graph_bundle_info(graph_root)
+
             connection.executemany(
                 "INSERT INTO index_metadata (key, value_json) VALUES (?, ?)",
                 [(key, _compact_json(value)) for key, value in metadata.items()],
@@ -622,6 +993,312 @@ def build_search_index(
         edge_count=total_edges,
         fts_row_count=total_nodes,
         module_link_count=total_module_links,
+        semantic_root_count=semantic_root_count,
+        semantic_dimensions=semantic_dimensions,
+        semantic_model_name=semantic_model_name,
+        indexed_layers=normalized_layers,
+        reused_semantic_root_count=reused_semantic_root_count,
+        generated_semantic_root_count=generated_semantic_root_count,
+    )
+
+
+def build_search_index(
+    graph_dir: str | Path,
+    output_path: str | Path | None = None,
+    *,
+    batch_size: int = 1000,
+    include_semantic_embeddings: bool = False,
+    semantic_text_selector: SemanticTextSelector | None = None,
+    semantic_batch_size: int = 32,
+    progress: Callable[[str], None] | None = None,
+) -> IndexBuildResult:
+    """Constrói o índice monolítico legado, mantido para compatibilidade."""
+    graph_root = Path(graph_dir).resolve()
+    index_path = Path(output_path).resolve() if output_path else default_index_path(graph_root)
+    return _build_index_for_layers(
+        graph_root,
+        index_path,
+        layers=tuple(GRAPH_FILENAMES),
+        index_mode="monolithic",
+        batch_size=batch_size,
+        include_semantic_embeddings=include_semantic_embeddings,
+        semantic_text_selector=semantic_text_selector,
+        semantic_batch_size=semantic_batch_size,
+        progress=progress,
+    )
+
+
+def build_layer_search_index(
+    graph_dir: str | Path,
+    layer: str,
+    output_path: str | Path | None = None,
+    *,
+    batch_size: int = 1000,
+    include_semantic_embeddings: bool = True,
+    semantic_text_selector: SemanticTextSelector | None = None,
+    semantic_batch_size: int = 32,
+    progress: Callable[[str], None] | None = None,
+    reuse_index_path: str | Path | None = None,
+) -> IndexBuildResult:
+    graph_root = Path(graph_dir).resolve()
+    index_path = (
+        Path(output_path).resolve()
+        if output_path is not None
+        else default_layer_index_path(graph_root, layer)
+    )
+    return _build_index_for_layers(
+        graph_root,
+        index_path,
+        layers=(layer,),
+        index_mode="layer",
+        batch_size=batch_size,
+        include_semantic_embeddings=include_semantic_embeddings,
+        semantic_text_selector=semantic_text_selector,
+        semantic_batch_size=semantic_batch_size,
+        progress=progress,
+        reuse_index_path=reuse_index_path,
+    )
+
+
+def _bundle_entry_from_result(
+    result: IndexBuildResult,
+    *,
+    bundle_dir: Path,
+) -> dict[str, Any]:
+    graph_file = result.graph_files[0]
+    try:
+        relative_path = result.index_path.relative_to(bundle_dir)
+        path_value = relative_path.as_posix()
+    except ValueError:
+        path_value = str(result.index_path)
+    return {
+        "path": path_value,
+        "schema_version": INDEX_SCHEMA_VERSION,
+        "graph_layer": graph_file.layer,
+        "graph_filename": graph_file.filename,
+        "graph_path": str(graph_file.path),
+        "graph_size_bytes": graph_file.size_bytes,
+        "graph_modified_ns": graph_file.modified_ns,
+        "graph_sha256": graph_file.sha256,
+        "graph_version": graph_file.graph_version,
+        "graph_generated_at": graph_file.generated_at,
+        "node_count": result.node_count,
+        "edge_count": result.edge_count,
+        "semantic_root_count": result.semantic_root_count,
+        "semantic_dimensions": result.semantic_dimensions,
+        "semantic_model_name": result.semantic_model_name,
+        "reused_semantic_root_count": result.reused_semantic_root_count,
+        "generated_semantic_root_count": result.generated_semantic_root_count,
+        "built_at": utc_now_iso(),
+    }
+
+
+def _resolve_bundle_entry_path(bundle_dir: Path, entry: dict[str, Any]) -> Path:
+    raw_path = Path(str(entry.get("path") or ""))
+    return raw_path.resolve() if raw_path.is_absolute() else (bundle_dir / raw_path).resolve()
+
+
+def _layer_requires_semantic_embeddings(layer: str) -> bool:
+    return layer in SEMANTIC_ROOT_TYPES
+
+
+
+def _refresh_index_graph_metadata(
+    index_path: Path,
+    *,
+    layer: str,
+    graph_path: Path,
+    graph_hash: str,
+) -> None:
+    stat = graph_path.stat()
+    connection = sqlite3.connect(index_path)
+    try:
+        with connection:
+            updated = connection.execute(
+                """
+                UPDATE graph_files
+                   SET source_path = ?,
+                       size_bytes = ?,
+                       modified_ns = ?,
+                       sha256 = ?
+                 WHERE graph_layer = ?
+                """,
+                (
+                    str(graph_path.resolve()),
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                    graph_hash,
+                    layer,
+                ),
+            ).rowcount
+            if updated != 1:
+                raise ValueError(
+                    f"O índice {index_path} não contém exatamente uma camada {layer}."
+                )
+            connection.execute(
+                "INSERT OR REPLACE INTO index_metadata (key, value_json) VALUES (?, ?)",
+                ("source_metadata_refreshed_at", _compact_json(utc_now_iso())),
+            )
+    finally:
+        connection.close()
+
+def build_index_bundle(
+    graph_dir: str | Path,
+    *,
+    layers: Iterable[str] | None = None,
+    output_dir: str | Path | None = None,
+    batch_size: int = 1000,
+    include_semantic_embeddings: bool = True,
+    semantic_text_selector: SemanticTextSelector | None = None,
+    semantic_batch_size: int = 32,
+    progress: Callable[[str], None] | None = None,
+    force: bool = False,
+    reuse_embeddings: bool = True,
+) -> IndexBundleBuildResult:
+    graph_root = Path(graph_dir).resolve()
+    if not graph_root.is_dir():
+        raise FileNotFoundError(f"Diretório de grafos não encontrado: {graph_root}")
+    requested_layers = _normalize_layers(layers)
+    bundle_dir = (
+        Path(output_dir).resolve()
+        if output_dir is not None
+        else graph_root / DEFAULT_INDEX_DIRECTORY_RELATIVE_PATH
+    )
+    bundle_dir.mkdir(parents=True, exist_ok=True)
+    bundle_path = bundle_dir / "index_bundle.json"
+
+    existing_payload: dict[str, Any] = {}
+    if bundle_path.is_file():
+        existing_payload = read_index_bundle(bundle_path)
+    existing_indexes = (
+        existing_payload.get("indexes")
+        if isinstance(existing_payload.get("indexes"), dict)
+        else {}
+    )
+    indexes: dict[str, dict[str, Any]] = {
+        str(layer): dict(entry)
+        for layer, entry in existing_indexes.items()
+        if isinstance(entry, dict)
+    }
+
+    selector = semantic_text_selector or SemanticTextSelector()
+    semantic_model_name = selector.config.model_name or DEFAULT_EMBEDDING_MODEL
+    legacy_index = default_index_path(graph_root)
+    built_layers: list[str] = []
+    skipped_layers: list[str] = []
+
+    for layer in requested_layers:
+        graph_path = graph_root / GRAPH_FILENAMES[layer]
+        if not graph_path.is_file():
+            raise FileNotFoundError(f"Arquivo de grafo não encontrado: {graph_path}")
+        graph_stat = graph_path.stat()
+        graph_hash = file_sha256(graph_path)
+        entry = indexes.get(layer) if isinstance(indexes.get(layer), dict) else None
+        existing_layer_path = (
+            _resolve_bundle_entry_path(bundle_dir, entry)
+            if entry is not None
+            else default_layer_index_path(graph_root, layer)
+        )
+        semantic_expected = include_semantic_embeddings and _layer_requires_semantic_embeddings(layer)
+        model_matches = (
+            not semantic_expected
+            or str((entry or {}).get("semantic_model_name") or "") == semantic_model_name
+        )
+        unchanged = bool(
+            not force
+            and entry is not None
+            and existing_layer_path.is_file()
+            and str(entry.get("schema_version") or "") == INDEX_SCHEMA_VERSION
+            and str(entry.get("graph_sha256") or "") == graph_hash
+            and model_matches
+        )
+
+        if unchanged:
+            _refresh_index_graph_metadata(
+                existing_layer_path,
+                layer=layer,
+                graph_path=graph_path,
+                graph_hash=graph_hash,
+            )
+            refreshed_entry = dict(entry)
+            refreshed_entry.update(
+                {
+                    "graph_path": str(graph_path.resolve()),
+                    "graph_size_bytes": graph_stat.st_size,
+                    "graph_modified_ns": graph_stat.st_mtime_ns,
+                    "graph_sha256": graph_hash,
+                    "skipped_at": utc_now_iso(),
+                }
+            )
+            indexes[layer] = refreshed_entry
+            skipped_layers.append(layer)
+            if progress:
+                progress(
+                    f"[INDEX] {layer}: conteúdo inalterado; índice reutilizado sem rebuild."
+                )
+            continue
+
+        output_path = bundle_dir / LAYER_INDEX_FILENAMES[layer]
+        reuse_index_path: Path | None = None
+        if reuse_embeddings:
+            if existing_layer_path.is_file():
+                reuse_index_path = existing_layer_path
+            elif legacy_index.is_file():
+                reuse_index_path = legacy_index
+
+        result = build_layer_search_index(
+            graph_root,
+            layer,
+            output_path,
+            batch_size=batch_size,
+            include_semantic_embeddings=semantic_expected,
+            semantic_text_selector=selector,
+            semantic_batch_size=semantic_batch_size,
+            progress=progress,
+            reuse_index_path=reuse_index_path,
+        )
+        indexes[layer] = _bundle_entry_from_result(
+            result,
+            bundle_dir=bundle_dir,
+        )
+        built_layers.append(layer)
+
+    for layer, entry in list(indexes.items()):
+        if layer not in GRAPH_FILENAMES or not isinstance(entry, dict):
+            indexes.pop(layer, None)
+            continue
+        index_file = _resolve_bundle_entry_path(bundle_dir, entry)
+        if not index_file.is_file():
+            indexes.pop(layer, None)
+
+    graph_bundle = _graph_bundle_info(graph_root)
+    payload = {
+        "version": INDEX_BUNDLE_VERSION,
+        "schema_version": INDEX_SCHEMA_VERSION,
+        "generated_at": utc_now_iso(),
+        "graph_dir": str(graph_root),
+        "graph_bundle": graph_bundle,
+        "semantic_model_name": semantic_model_name if include_semantic_embeddings else None,
+        "indexes": {
+            layer: indexes[layer]
+            for layer in GRAPH_FILENAMES
+            if layer in indexes
+        },
+    }
+    temporary_bundle = bundle_path.with_suffix(bundle_path.suffix + ".tmp")
+    temporary_bundle.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary_bundle, bundle_path)
+
+    return IndexBundleBuildResult(
+        graph_dir=graph_root,
+        bundle_path=bundle_path,
+        requested_layers=requested_layers,
+        built_layers=tuple(built_layers),
+        skipped_layers=tuple(skipped_layers),
+        indexes=payload["indexes"],
     )
 
 

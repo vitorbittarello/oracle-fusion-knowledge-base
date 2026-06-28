@@ -994,3 +994,80 @@ nova geração dos grafos
 ```
 
 A ferramenta melhora à medida que o conhecimento validado é registrado, sem transformar simples semelhanças textuais em relações permanentes.
+
+---
+
+## Índices separados e atualização do conhecimento
+
+Cada camada possui seu próprio índice:
+
+```text
+search_index/
+├── index_bundle.json
+├── master.sqlite
+├── business.sqlite
+├── physical.sqlite
+├── otbi_analytics.sqlite
+├── otbi_security.sqlite
+└── rest.sqlite
+```
+
+A primeira criação é feita com:
+
+### Bash
+
+```bash
+python -u build_knowledge_base.py build-index \
+  --graph-dir "./data/graph/scm"
+```
+
+### PowerShell
+
+```powershell
+& ".\.venv\Scripts\python.exe" -u build_knowledge_base.py build-index `
+  --graph-dir ".\data\graph\scm"
+```
+
+O índice monolítico anterior pode ser usado como origem para reaproveitar embeddings durante a migração.
+
+Quando a alteração for apenas em aliases e rotas de negócio, reconstrua somente o master:
+
+### Bash
+
+```bash
+python build_knowledge_base.py build-index \
+  --graph-dir "./data/graph/scm" \
+  --layer master \
+  --layer business
+```
+
+### PowerShell
+
+```powershell
+& ".\.venv\Scripts\python.exe" build_knowledge_base.py build-index `
+  --graph-dir ".\data\graph\scm" `
+  --layer master `
+  --layer business
+```
+
+Sem `--layer`, o sistema verifica todas as camadas e pula as que não mudaram. Dentro da camada alterada, somente nós novos ou cujo conteúdo mudou têm embeddings recalculados.
+
+Valide depois da atualização:
+
+### Bash
+
+```bash
+python build_knowledge_base.py validate-index \
+  --graph-dir "./data/graph/scm"
+```
+
+### PowerShell
+
+```powershell
+& ".\.venv\Scripts\python.exe" build_knowledge_base.py validate-index `
+  --graph-dir ".\data\graph\scm"
+```
+
+A busca usa o manifesto automaticamente e informa `backend: sqlite_bundle` no bloco `routing`.
+
+GPU NVIDIA com CUDA é recomendada para grandes gerações iniciais, mas a atualização normal de curadoria não deve exigir a reconstrução completa dos índices.
