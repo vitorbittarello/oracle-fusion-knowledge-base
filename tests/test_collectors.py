@@ -95,3 +95,196 @@ class CollectorParsingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FakeJsonResponse:
+    def __init__(self, url, payload, status_code=200):
+        self.url = url
+        self._payload = payload
+        self.status_code = status_code
+        self.headers = {"Content-Type": "application/json"}
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            import requests
+
+            error = requests.HTTPError(f"HTTP {self.status_code}")
+            error.response = self
+            raise error
+
+    def json(self):
+        return self._payload
+
+
+class FakeJsonSession:
+    def __init__(self, pages):
+        self.pages = pages
+        self.headers = {}
+        self.auth = None
+        self.calls = []
+
+    def mount(self, prefix, adapter):
+        return None
+
+    def get(self, url, headers=None, timeout=None, verify=True):
+        self.calls.append(url)
+        response = self.pages[url]
+        if isinstance(response, tuple):
+            payload, status_code = response
+        else:
+            payload, status_code = response, 200
+        return FakeJsonResponse(url, payload, status_code=status_code)
+
+
+class AdfMetadataCollectorTest(unittest.TestCase):
+    def test_collects_catalog_and_resource_describes_automatically(self):
+        import tempfile
+        from pathlib import Path
+
+        from oracle_knowledge.collectors.adf_metadata_collector import (
+            AdfMetadataCollector,
+        )
+
+        base_url = "https://fusion.example.test"
+        catalog_url = (
+            f"{base_url}/fscmRestApi/resources/latest/describe"
+            "?metadataMode=minimal&includeChildren=true"
+        )
+        custom_url = (
+            f"{base_url}/fscmRestApi/resources/latest/APCUSTOMBM_c/describe"
+        )
+        purchase_orders_url = (
+            f"{base_url}/fscmRestApi/resources/latest/purchaseOrders/describe"
+        )
+        pages = {
+            catalog_url: {
+                "Resources": {
+                    "APCUSTOMBM_c": {
+                        "title": "AP CUSTOM BM",
+                        "children": {
+                            "Attachment": {"title": "Anexos"}
+                        },
+                    },
+                    "purchaseOrders": {"title": "Purchase Orders"},
+                }
+            },
+            custom_url: {
+                "Resources": {
+                    "APCUSTOMBM_c": {
+                        "title": "AP CUSTOM BM",
+                        "attributes": [
+                            {
+                                "name": "Id",
+                                "type": "number",
+                                "mandatory": True,
+                                "queryable": True,
+                            },
+                            {
+                                "name": "ExternalReference_c",
+                                "type": "string",
+                                "title": "External Reference",
+                                "maxLength": 80,
+                            },
+                        ],
+                        "children": {
+                            "Attachment": {"title": "Anexos"}
+                        },
+                    }
+                }
+            },
+            purchase_orders_url: {
+                "Resources": {
+                    "purchaseOrders": {
+                        "title": "Purchase Orders",
+                        "attributes": [
+                            {"name": "OrderNumber", "type": "string"}
+                        ],
+                        "children": {
+                            "DFF": {"title": "Descriptive Flexfields"}
+                        },
+                    }
+                }
+            },
+        }
+        session = FakeJsonSession(pages)
+        collector = AdfMetadataCollector(
+            base_url=base_url,
+            username="user",
+            password="secret",
+            session=session,
+            delay_seconds=0,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            payload = collector.collect(temporary_dir)
+            root = Path(temporary_dir)
+
+            self.assertEqual(payload["stats"]["catalog_resources"], 2)
+            self.assertEqual(payload["stats"]["collected_resources"], 2)
+            self.assertEqual(payload["stats"]["custom_attributes"], 1)
+            self.assertEqual(payload["stats"]["flexfield_children"], 1)
+            self.assertTrue((root / "manifest.json").is_file())
+            self.assertTrue((root / "catalog.json").is_file())
+            self.assertTrue(
+                (root / "raw/resources/APCUSTOMBM_c.json").is_file()
+            )
+
+            custom = next(
+                item
+                for item in payload["resources"]
+                if item["name"] == "APCUSTOMBM_c"
+            )
+            self.assertTrue(custom["is_custom"])
+            self.assertEqual(
+                custom["attributes"][1]["title"],
+                "External Reference",
+            )
+
+    def test_custom_only_limits_describe_requests_and_resume_reuses_files(self):
+        import tempfile
+
+        from oracle_knowledge.collectors.adf_metadata_collector import (
+            AdfMetadataCollector,
+        )
+
+        base_url = "https://fusion.example.test"
+        catalog_url = (
+            f"{base_url}/fscmRestApi/resources/latest/describe"
+            "?metadataMode=minimal&includeChildren=true"
+        )
+        custom_url = (
+            f"{base_url}/fscmRestApi/resources/latest/APCUSTOMBM_c/describe"
+        )
+        pages = {
+            catalog_url: {
+                "Resources": {
+                    "APCUSTOMBM_c": {"title": "AP CUSTOM BM"},
+                    "purchaseOrders": {"title": "Purchase Orders"},
+                }
+            },
+            custom_url: {
+                "Resources": {
+                    "APCUSTOMBM_c": {
+                        "title": "AP CUSTOM BM",
+                        "attributes": [],
+                    }
+                }
+            },
+        }
+        session = FakeJsonSession(pages)
+        collector = AdfMetadataCollector(
+            base_url=base_url,
+            username="user",
+            password="secret",
+            session=session,
+            delay_seconds=0,
+        )
+
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            first = collector.collect(temporary_dir, custom_only=True)
+            first_call_count = len(session.calls)
+            second = collector.collect(temporary_dir, custom_only=True)
+
+            self.assertEqual(first["stats"]["selected_resources"], 1)
+            self.assertEqual(second["stats"]["reused_resources"], 1)
+            self.assertEqual(len(session.calls), first_call_count)

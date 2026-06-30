@@ -45,6 +45,7 @@ MODULE_SOURCE_FILES: dict[str, tuple[str, str, str]] = {
     "functional": ("functional_fragments", "functional/fragments.jsonl", "jsonl"),
     "otbi": ("otbi_catalog", "otbi/catalog.json", "json"),
     "rest": ("rest_catalog", "rest/catalog.json", "json"),
+    "adf": ("adf_catalog", "environment/adf/catalog.json", "json"),
 }
 
 MOJIBAKE_MARKERS = ("├", "┬", "�")
@@ -471,6 +472,22 @@ def validate_module_directory(module_dir: str | Path) -> ValidationReport:
             "exists": path.exists(),
             "stats": payload.get("stats") if isinstance(payload, dict) else None,
         }
+
+    adf_source = collected_sources.get("adf") or {}
+    if adf_source.get("expected"):
+        adf_manifest_path = root / "environment" / "adf" / "manifest.json"
+        manifest_payload = _validate_json_file(
+            report,
+            adf_manifest_path,
+            required=True,
+            code_prefix="MODULE_ADF_MANIFEST",
+        )
+        if manifest_payload is not None and not isinstance(manifest_payload, dict):
+            report.error(
+                "MODULE_ADF_MANIFEST_STRUCTURE",
+                "O manifesto ADF deve conter um objeto JSON.",
+                path=adf_manifest_path,
+            )
 
     report.metadata = {
         "module_id": metadata.get("module_id"),

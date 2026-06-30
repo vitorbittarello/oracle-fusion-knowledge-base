@@ -50,6 +50,46 @@ class ValidationCommandsTest(unittest.TestCase):
                 False,
             )
 
+    def test_validate_module_accepts_optional_adf_environment_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_dir:
+            root = Path(temporary_dir)
+            write_json(
+                root / "module.json",
+                {
+                    "module_id": "procurement",
+                    "module_name": "Procurement",
+                    "release": "26B",
+                    "source_urls": {
+                        "physical": "https://example.test/physical",
+                        "functional": [],
+                        "otbi": None,
+                        "rest": None,
+                        "adf": "https://fusion.example.test",
+                    },
+                    "outputs": {
+                        "physical_manifest": str(root / "physical/manifest.json"),
+                        "adf_catalog": str(root / "environment/adf/catalog.json"),
+                        "adf_manifest": str(root / "environment/adf/manifest.json"),
+                    },
+                },
+            )
+            write_json(root / "physical/manifest.json", {"tables": []})
+            write_json(root / "rules/validated_rules.json", {"rules": []})
+            write_json(root / "config/entity_aliases.json", {"entities": []})
+            write_json(
+                root / "environment/adf/catalog.json",
+                {"resources": [], "stats": {"catalog_resources": 0}},
+            )
+            write_json(
+                root / "environment/adf/manifest.json",
+                {"stats": {"catalog_resources": 0}},
+            )
+
+            report = validate_module_directory(root)
+
+            self.assertEqual(report.error_count, 0)
+            self.assertTrue(report.metadata["sources"]["adf"]["expected"])
+
     def test_validate_module_reports_missing_expected_source(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)

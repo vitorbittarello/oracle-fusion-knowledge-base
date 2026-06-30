@@ -1628,3 +1628,70 @@ python -u build_knowledge_base.py build-index \
 CUDA acelera principalmente a geração dos embeddings semânticos. A criação das tabelas SQLite, FTS5, hashes, metadados e validações continua sendo executada pela CPU. O ganho tende a ser mais relevante na primeira indexação de módulos grandes ou em alterações em massa.
 
 Em ambientes sem CUDA, omita `--semantic-device cuda`. O rebuild seletivo por camada e a reutilização por `content_hash` reduzem a necessidade de recalcular embeddings, portanto CUDA é uma otimização de desempenho, não uma dependência funcional.
+
+## Coleta automatizada de metadados ADF do ambiente
+
+O comando `collect-adf` consulta o catálogo `/describe` do ambiente Fusion e,
+sem navegação manual, coleta o `describe` de cada recurso selecionado. Os
+arquivos ficam separados da documentação oficial em
+`environment/adf`, pois representam a configuração efetivamente publicada no
+ambiente.
+
+No PowerShell, defina o usuário e informe a senha apenas quando o comando
+solicitar:
+
+```powershell
+$env:FUSION_USERNAME = "seu.usuario"
+
+python build_knowledge_base.py collect-adf `
+  --base-url "https://seu-ambiente.fa.regiao.oraclecloud.com" `
+  --module-dir ".\data\modules\procurement"
+```
+
+Para uma execução não interativa, a senha pode ser fornecida pela variável de
+ambiente `FUSION_PASSWORD`. Também é possível usar um token OAuth na variável
+`FUSION_BEARER_TOKEN`.
+
+A coleta é retomável. Recursos já gravados em `raw/resources` não são
+consultados novamente, salvo quando `--force-refresh` é informado.
+
+Opções úteis:
+
+```powershell
+# Somente objetos customizados cujo nome termina em _c
+python build_knowledge_base.py collect-adf `
+  --base-url "https://seu-ambiente.fa.regiao.oraclecloud.com" `
+  --module-dir ".\data\modules\procurement" `
+  --custom-only
+
+# Apenas recursos cujo nome corresponde ao padrão
+python build_knowledge_base.py collect-adf `
+  --base-url "https://seu-ambiente.fa.regiao.oraclecloud.com" `
+  --module-dir ".\data\modules\procurement" `
+  --include-regex "purchase|supplier|agreement"
+
+# Somente o catálogo geral, sem chamar cada recurso
+python build_knowledge_base.py collect-adf `
+  --base-url "https://seu-ambiente.fa.regiao.oraclecloud.com" `
+  --module-dir ".\data\modules\procurement" `
+  --catalog-only
+```
+
+Arquivos produzidos:
+
+```text
+data/modules/procurement/environment/adf/
+├── manifest.json
+├── catalog.json
+└── raw/
+    ├── catalog.json
+    ├── catalog.meta.json
+    └── resources/
+        ├── <recurso>.json
+        └── <recurso>.meta.json
+```
+
+O catálogo normalizado preserva a origem `fusion_adf_rest_metadata` e registra
+atributos, filhos, ações, links e indicadores de objetos e atributos
+customizados. Essa evidência descreve a camada de serviço publicada; ela não é
+tratada automaticamente como prova de tabela física ou de join SQL.

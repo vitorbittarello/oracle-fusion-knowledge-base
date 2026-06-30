@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -14,6 +15,7 @@ from gerar_skills import (
     inferir_release,
     normalizar_url_modulo,
 )
+from oracle_knowledge.collectors.adf_metadata_collector import AdfMetadataCollector
 from oracle_knowledge.collectors.functional_docs_collector import FunctionalDocsCollector
 from oracle_knowledge.collectors.otbi_collector import OtbiCollector
 from oracle_knowledge.collectors.rest_collector import RestCollector
@@ -124,6 +126,52 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_collection_arguments(rest)
     rest.add_argument("--output", default=str(DEFAULT_REST))
     rest.add_argument("--max-pages", type=int)
+
+    adf = subparsers.add_parser(
+        "collect-adf",
+        help=(
+            "Coleta automaticamente o catálogo ADF REST do ambiente e os "
+            "describes dos recursos selecionados."
+        ),
+    )
+    adf.add_argument("--base-url", required=True, help="URL base HTTPS do Fusion.")
+    adf.add_argument(
+        "--module-dir",
+        help=(
+            "Diretório do módulo. Quando informado, grava em "
+            "environment/adf e atualiza module.json."
+        ),
+    )
+    adf.add_argument(
+        "--output-dir",
+        help="Diretório explícito de saída. Não use junto com --module-dir.",
+    )
+    adf.add_argument("--api-root", default="fscmRestApi")
+    adf.add_argument("--api-version", default="latest")
+    adf.add_argument("--accept-language", default="en-US")
+    adf.add_argument("--username")
+    adf.add_argument("--username-env", default="FUSION_USERNAME")
+    adf.add_argument("--password-env", default="FUSION_PASSWORD")
+    adf.add_argument("--bearer-token-env", default="FUSION_BEARER_TOKEN")
+    adf.add_argument(
+        "--anonymous",
+        action="store_true",
+        help="Executa sem Basic Auth nem Bearer Token.",
+    )
+    adf.add_argument("--resource", action="append", default=[])
+    adf.add_argument("--include-regex", action="append", default=[])
+    adf.add_argument("--exclude-regex", action="append", default=[])
+    adf.add_argument(
+        "--custom-only",
+        action="store_true",
+        help="Coleta somente recursos cujo nome termina em _c.",
+    )
+    adf.add_argument("--max-resources", type=int)
+    adf.add_argument("--catalog-only", action="store_true")
+    adf.add_argument("--delay-seconds", type=float, default=0.15)
+    adf.add_argument("--force-refresh", action="store_true")
+    adf.add_argument("--no-resume", action="store_true")
+    adf.add_argument("--no-verify-ssl", action="store_true")
 
     link = subparsers.add_parser(
         "link",
@@ -428,6 +476,8 @@ def _module_paths(output_dir: str | Path) -> dict[str, Path]:
         "functional": root / "functional" / "fragments.jsonl",
         "otbi": root / "otbi" / "catalog.json",
         "rest": root / "rest" / "catalog.json",
+        "adf_manifest": root / "environment" / "adf" / "manifest.json",
+        "adf_catalog": root / "environment" / "adf" / "catalog.json",
         "rules": root / "rules" / "validated_rules.json",
         "entities": root / "config" / "entity_aliases.json",
     }
@@ -590,6 +640,85 @@ def collect_rest(args: argparse.Namespace) -> None:
     payload = collector.collect(config["rest"], max_pages=args.max_pages)
     write_json(args.output, payload)
     print(f"[REST] {payload['stats']} gravado em {args.output}")
+
+
+def collect_adf(args: argparse.Namespace) -> None:
+    if bool(args.module_dir) == bool(args.output_dir):
+        raise SystemExit("Informe exatamente um entre --module-dir e --output-dir.")
+
+    module_dir = Path(args.module_dir).resolve() if args.module_dir else None
+    output_dir = (
+        module_dir / "environment" / "adf"
+        if module_dir is not None
+        else Path(args.output_dir).resolve()
+    )
+
+    username = args.username or os.getenv(args.username_env)
+    password = os.getenv(args.password_env)
+    bearer_token = os.getenv(args.bearer_token_env)
+
+    if args.anonymous:
+        username = None
+        password = None
+        bearer_token = None
+    elif bearer_token:
+        username = None
+        password = None
+    elif not username:
+        raise SystemExit(
+            "Usuário ausente. Informe --username, defina FUSION_USERNAME, "
+            "defina FUSION_BEARER_TOKEN ou use --anonymous."
+        )
+    elif not password:
+        raise SystemExit(
+            f"Senha ausente. Defina a variável de ambiente {args.password_env}."
+        )
+
+    collector = AdfMetadataCollector(
+        base_url=args.base_url,
+        username=username,
+        password=password,
+        bearer_token=bearer_token,
+        api_root=args.api_root,
+        api_version=args.api_version,
+        accept_language=args.accept_language,
+        delay_seconds=args.delay_seconds,
+        verify_ssl=not args.no_verify_ssl,
+    )
+    payload = collector.collect(
+        output_dir,
+        resources=args.resource,
+        include_patterns=args.include_regex,
+        exclude_patterns=args.exclude_regex,
+        custom_only=args.custom_only,
+        max_resources=args.max_resources,
+        catalog_only=args.catalog_only,
+        resume=not args.no_resume,
+        force_refresh=args.force_refresh,
+    )
+
+    if module_dir is not None:
+        metadata_path = module_dir / "module.json"
+        if not metadata_path.is_file():
+            raise SystemExit(f"module.json não encontrado: {metadata_path}")
+        metadata = read_json(metadata_path, {})
+        if not isinstance(metadata, dict):
+            raise SystemExit(f"module.json inválido: {metadata_path}")
+        source_urls = metadata.get("source_urls")
+        if not isinstance(source_urls, dict):
+            source_urls = {}
+            metadata["source_urls"] = source_urls
+        outputs = metadata.get("outputs")
+        if not isinstance(outputs, dict):
+            outputs = {}
+            metadata["outputs"] = outputs
+        source_urls["adf"] = args.base_url.rstrip("/")
+        outputs["adf_manifest"] = str((output_dir / "manifest.json").resolve())
+        outputs["adf_catalog"] = str((output_dir / "catalog.json").resolve())
+        metadata["generated_at"] = utc_now_iso()
+        write_json(metadata_path, metadata)
+
+    print(f"[ADF] {payload['stats']} gravado em {output_dir}")
 
 
 def _existing_paths(values: list[str | Path]) -> list[str]:
@@ -934,6 +1063,8 @@ def main() -> None:
         collect_otbi(args)
     elif args.command == "collect-rest":
         collect_rest(args)
+    elif args.command == "collect-adf":
+        collect_adf(args)
     elif args.command == "link":
         link_graph(args)
     elif args.command == "split-graph":

@@ -14,3 +14,4 @@ oracle_fusion_knowledge_base.egg-info/
 *.patch
 *.log
 .idea/
+scripts/
