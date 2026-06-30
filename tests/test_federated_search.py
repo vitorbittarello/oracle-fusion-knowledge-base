@@ -330,6 +330,15 @@ class FederatedGraphSearchTest(unittest.TestCase):
             self.assertNotIn("table:noise", identifiers)
             self.assertTrue(payload["routing"]["semantic_fallback_roots"])
             self.assertEqual(model.query_calls, 1)
+            self.assertEqual(model.document_calls, 0)
+            physical_diagnostics = payload["routing"][
+                "semantic_inference_diagnostics"
+            ]["physical"]
+            self.assertEqual(
+                physical_diagnostics["persisted_candidates"],
+                1,
+            )
+            self.assertEqual(physical_diagnostics["live_candidates"], 0)
             self.assertIn("timings_seconds", payload["routing"])
             self.assertIn("total", payload["routing"]["timings_seconds"])
             self.assertTrue(
@@ -441,7 +450,15 @@ class FederatedGraphSearchTest(unittest.TestCase):
             self.assertEqual(diagnostics["linked_operation_count"], 200)
             self.assertLessEqual(diagnostics["semantic_candidate_count"], 16)
             self.assertGreater(diagnostics["fts_candidate_count"], 0)
-            self.assertLess(model.document_text_count, 80)
+            self.assertEqual(model.document_text_count, 0)
+            semantic_diagnostics = payload["routing"][
+                "semantic_inference_diagnostics"
+            ]["rest"]
+            self.assertEqual(semantic_diagnostics["live_candidates"], 0)
+            self.assertEqual(
+                semantic_diagnostics["persisted_candidates"],
+                diagnostics["semantic_candidate_count"],
+            )
 
 
 

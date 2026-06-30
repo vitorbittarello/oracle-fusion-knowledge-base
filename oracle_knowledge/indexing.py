@@ -16,10 +16,11 @@ from oracle_knowledge.search.semantic_context import (
     DEFAULT_EMBEDDING_MODEL,
     SemanticTextSelector,
 )
+from oracle_knowledge.search.semantic_documents import semantic_document_text
 
-INDEX_SCHEMA_VERSION = "3.0.0"
-INDEX_USER_VERSION = 3
-SUPPORTED_INDEX_SCHEMA_VERSIONS = {"2.0.0", INDEX_SCHEMA_VERSION}
+INDEX_SCHEMA_VERSION = "4.0.0"
+INDEX_USER_VERSION = 4
+SUPPORTED_INDEX_SCHEMA_VERSIONS = {"2.0.0", "3.0.0", INDEX_SCHEMA_VERSION}
 INDEX_BUNDLE_VERSION = "1.0.0"
 DEFAULT_INDEX_DIRECTORY_RELATIVE_PATH = Path("search_index")
 DEFAULT_INDEX_RELATIVE_PATH = DEFAULT_INDEX_DIRECTORY_RELATIVE_PATH / "knowledge_index.sqlite"
@@ -38,6 +39,7 @@ REQUIRED_SQL_INDEXES = {
     "idx_edges_target",
     "idx_edges_type",
     "idx_semantic_roots_model",
+    "idx_semantic_segments_model",
 }
 
 
@@ -81,9 +83,13 @@ class IndexBuildResult:
     semantic_root_count: int
     semantic_dimensions: int | None
     semantic_model_name: str | None
+    semantic_segment_count: int = 0
+    semantic_segment_node_count: int = 0
     indexed_layers: tuple[str, ...] = ()
     reused_semantic_root_count: int = 0
     generated_semantic_root_count: int = 0
+    reused_semantic_segment_count: int = 0
+    generated_semantic_segment_count: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -98,9 +104,13 @@ class IndexBuildResult:
             "semantic_root_count": self.semantic_root_count,
             "semantic_dimensions": self.semantic_dimensions,
             "semantic_model_name": self.semantic_model_name,
+            "semantic_segment_count": self.semantic_segment_count,
+            "semantic_segment_node_count": self.semantic_segment_node_count,
             "indexed_layers": list(self.indexed_layers),
             "reused_semantic_root_count": self.reused_semantic_root_count,
             "generated_semantic_root_count": self.generated_semantic_root_count,
+            "reused_semantic_segment_count": self.reused_semantic_segment_count,
+            "generated_semantic_segment_count": self.generated_semantic_segment_count,
         }
 
 
@@ -216,7 +226,7 @@ def _configure_build_connection(connection: sqlite3.Connection) -> None:
 def _create_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
-        PRAGMA user_version = 3;
+        PRAGMA user_version = 4;
 
         CREATE TABLE index_metadata (
             key TEXT PRIMARY KEY,
@@ -293,6 +303,16 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             FOREIGN KEY (node_pk) REFERENCES nodes(node_pk) ON DELETE CASCADE
         ) WITHOUT ROWID;
 
+        CREATE TABLE semantic_segments (
+            node_pk INTEGER NOT NULL,
+            segment_index INTEGER NOT NULL,
+            model_name TEXT NOT NULL,
+            dimensions INTEGER NOT NULL,
+            embedding BLOB NOT NULL,
+            PRIMARY KEY (node_pk, segment_index),
+            FOREIGN KEY (node_pk) REFERENCES nodes(node_pk) ON DELETE CASCADE
+        ) WITHOUT ROWID;
+
         CREATE INDEX idx_nodes_layer_type
             ON nodes(graph_layer, node_type);
         CREATE INDEX idx_nodes_layer_title
@@ -310,6 +330,8 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             ON edges(graph_layer, edge_type);
         CREATE INDEX idx_semantic_roots_model
             ON semantic_roots(model_name, dimensions);
+        CREATE INDEX idx_semantic_segments_model
+            ON semantic_segments(model_name, dimensions, node_pk);
         """
     )
 
@@ -606,6 +628,14 @@ SEMANTIC_ROOT_TYPES = {
     "rest": {"rest_resource"},
 }
 
+SEMANTIC_SEGMENT_NODE_TYPES = {
+    "physical": {"physical_column"},
+    "otbi_analytics": {"otbi_business_question"},
+    "rest": {"rest_operation"},
+}
+
+SEMANTIC_SEGMENT_PROFILE_VERSION = "1"
+
 
 def _semantic_root_text(row: sqlite3.Row) -> str:
     return "\n".join(
@@ -680,6 +710,269 @@ def _load_reusable_semantic_roots(
         return {}
     finally:
         connection.close()
+
+
+def _semantic_segment_profile(selector: SemanticTextSelector) -> dict[str, Any]:
+    return {
+        "version": SEMANTIC_SEGMENT_PROFILE_VERSION,
+        "minimum_segment_characters": (
+            selector.config.minimum_segment_characters
+        ),
+        "maximum_segment_characters": (
+            selector.config.maximum_segment_characters
+        ),
+    }
+
+
+def _load_reusable_semantic_segments(
+    index_path: str | Path | None,
+    *,
+    model_name: str,
+    profile: dict[str, Any],
+) -> dict[tuple[str, str, str], list[tuple[int, int, bytes]]]:
+    if index_path is None:
+        return {}
+    path = Path(index_path).resolve()
+    if not path.is_file():
+        return {}
+
+    try:
+        connection = sqlite3.connect(
+            f"file:{path.as_posix()}?mode=ro",
+            uri=True,
+        )
+    except sqlite3.Error:
+        return {}
+
+    try:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        if not {
+            "nodes",
+            "semantic_segments",
+            "index_metadata",
+        }.issubset(tables):
+            return {}
+
+        metadata = read_index_metadata(connection)
+        if metadata.get("schema_version") not in SUPPORTED_INDEX_SCHEMA_VERSIONS:
+            return {}
+        if metadata.get("semantic_segment_profile") != profile:
+            return {}
+
+        rows = connection.execute(
+            """
+            SELECT n.graph_layer,
+                   n.node_id,
+                   n.content_hash,
+                   s.segment_index,
+                   s.dimensions,
+                   s.embedding
+              FROM semantic_segments s
+              JOIN nodes n ON n.node_pk = s.node_pk
+             WHERE s.model_name = ?
+             ORDER BY n.node_pk, s.segment_index
+            """,
+            (model_name,),
+        ).fetchall()
+
+        reusable: dict[
+            tuple[str, str, str],
+            list[tuple[int, int, bytes]],
+        ] = {}
+        for (
+            layer,
+            node_id,
+            content_hash,
+            segment_index,
+            dimensions,
+            embedding,
+        ) in rows:
+            dimensions = int(dimensions)
+            payload = bytes(embedding)
+            if dimensions <= 0 or len(payload) != dimensions * 4:
+                continue
+            key = (str(layer), str(node_id), str(content_hash))
+            reusable.setdefault(key, []).append(
+                (int(segment_index), dimensions, payload)
+            )
+        return reusable
+    except sqlite3.Error:
+        return {}
+    finally:
+        connection.close()
+
+
+def _build_semantic_segment_index(
+    connection: sqlite3.Connection,
+    selector: SemanticTextSelector,
+    *,
+    batch_size: int,
+    progress: Callable[[str], None] | None,
+    reusable_segments: dict[
+        tuple[str, str, str],
+        list[tuple[int, int, bytes]],
+    ] | None = None,
+) -> tuple[int, int, int | None, str, int, int]:
+    if batch_size <= 0:
+        raise ValueError("semantic_batch_size deve ser maior que zero")
+
+    clauses: list[str] = []
+    parameters: list[str] = []
+    for layer, node_types in SEMANTIC_SEGMENT_NODE_TYPES.items():
+        placeholders = ",".join("?" for _ in node_types)
+        clauses.append(
+            f"(graph_layer = ? AND node_type IN ({placeholders}))"
+        )
+        parameters.extend([layer, *sorted(node_types)])
+
+    connection.row_factory = sqlite3.Row
+    cursor = connection.execute(
+        f"""
+        SELECT node_pk,
+               graph_layer,
+               node_id,
+               content_hash,
+               payload_json
+          FROM nodes
+         WHERE {' OR '.join(clauses)}
+         ORDER BY node_pk
+        """,
+        parameters,
+    )
+
+    model_name = selector.config.model_name or DEFAULT_EMBEDDING_MODEL
+    reusable = reusable_segments or {}
+    inserted_segments = 0
+    indexed_nodes = 0
+    reused_count = 0
+    generated_count = 0
+    dimensions: int | None = None
+
+    while rows := cursor.fetchmany(batch_size):
+        insert_rows: list[
+            tuple[int, int, str, int, sqlite3.Binary]
+        ] = []
+        encode_segments: list[str] = []
+        encode_targets: list[tuple[int, int]] = []
+
+        for row in rows:
+            key = (
+                str(row["graph_layer"]),
+                str(row["node_id"]),
+                str(row["content_hash"]),
+            )
+            reused = reusable.get(key)
+            if reused:
+                reusable_dimensions = {item[1] for item in reused}
+                if len(reusable_dimensions) == 1:
+                    reused_dimension = next(iter(reusable_dimensions))
+                    if dimensions is None:
+                        dimensions = reused_dimension
+                    if dimensions == reused_dimension:
+                        insert_rows.extend(
+                            (
+                                int(row["node_pk"]),
+                                segment_index,
+                                model_name,
+                                reused_dimension,
+                                sqlite3.Binary(embedding),
+                            )
+                            for segment_index, _, embedding in reused
+                        )
+                        reused_count += len(reused)
+                        indexed_nodes += 1
+                        continue
+
+            payload = json.loads(str(row["payload_json"]))
+            if not isinstance(payload, dict):
+                raise ValueError(
+                    "Payload de nó inválido durante a indexação semântica: "
+                    f"{row['node_id']}"
+                )
+            document = semantic_document_text(payload)
+            segments, mappings = selector.prepare_document_segments([document])
+            indexes = mappings[0] if mappings else []
+            if not indexes:
+                continue
+
+            for segment_index, flat_index in enumerate(indexes):
+                encode_segments.append(segments[flat_index])
+                encode_targets.append((int(row["node_pk"]), segment_index))
+            indexed_nodes += 1
+
+        if encode_segments:
+            embeddings = selector.encode_documents(encode_segments)
+            if embeddings.shape[0] != len(encode_targets):
+                raise RuntimeError(
+                    "O modelo semântico devolveu quantidade incompatível de "
+                    "vetores para os segmentos persistidos."
+                )
+            current_dimensions = (
+                int(embeddings.shape[1]) if embeddings.ndim == 2 else 0
+            )
+            if current_dimensions <= 0:
+                raise RuntimeError("O modelo semântico devolveu vetores vazios.")
+            if dimensions is None:
+                dimensions = current_dimensions
+            elif dimensions != current_dimensions:
+                raise RuntimeError(
+                    "O modelo semântico alterou a dimensão dos vetores durante "
+                    "a indexação."
+                )
+
+            insert_rows.extend(
+                (
+                    node_pk,
+                    segment_index,
+                    model_name,
+                    dimensions,
+                    sqlite3.Binary(
+                        np.asarray(vector, dtype="<f4").tobytes()
+                    ),
+                )
+                for (node_pk, segment_index), vector in zip(
+                    encode_targets,
+                    embeddings,
+                    strict=True,
+                )
+            )
+            generated_count += len(encode_targets)
+
+        if insert_rows:
+            connection.executemany(
+                """
+                INSERT INTO semantic_segments (
+                    node_pk,
+                    segment_index,
+                    model_name,
+                    dimensions,
+                    embedding
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                insert_rows,
+            )
+            inserted_segments += len(insert_rows)
+
+        if progress:
+            progress(
+                "[INDEX] Segmentos semânticos: "
+                f"{indexed_nodes} nós, {inserted_segments} segmentos "
+                f"({reused_count} reutilizados, {generated_count} gerados)."
+            )
+
+    return (
+        inserted_segments,
+        indexed_nodes,
+        dimensions,
+        model_name,
+        reused_count,
+        generated_count,
+    )
 
 
 def _build_semantic_root_index(
@@ -874,8 +1167,13 @@ def _build_index_for_layers(
     semantic_root_count = 0
     semantic_dimensions: int | None = None
     semantic_model_name: str | None = None
+    semantic_segment_count = 0
+    semantic_segment_node_count = 0
     reused_semantic_root_count = 0
     generated_semantic_root_count = 0
+    reused_semantic_segment_count = 0
+    generated_semantic_segment_count = 0
+    semantic_segment_profile: dict[str, Any] | None = None
 
     connection = sqlite3.connect(temporary_path)
     try:
@@ -941,6 +1239,47 @@ def _build_index_for_layers(
                     progress=progress,
                     reusable_roots=reusable_roots,
                 )
+                semantic_segment_profile = _semantic_segment_profile(selector)
+                reusable_segments = _load_reusable_semantic_segments(
+                    reuse_index_path,
+                    model_name=model_name,
+                    profile=semantic_segment_profile,
+                )
+                if progress:
+                    if reusable_segments:
+                        progress(
+                            "[INDEX] Construindo segmentos semânticos persistidos "
+                            f"com {len(reusable_segments)} nós reutilizáveis..."
+                        )
+                    else:
+                        progress(
+                            "[INDEX] Construindo segmentos semânticos persistidos..."
+                        )
+                (
+                    semantic_segment_count,
+                    semantic_segment_node_count,
+                    segment_dimensions,
+                    segment_model_name,
+                    reused_semantic_segment_count,
+                    generated_semantic_segment_count,
+                ) = _build_semantic_segment_index(
+                    connection,
+                    selector,
+                    batch_size=semantic_batch_size,
+                    progress=progress,
+                    reusable_segments=reusable_segments,
+                )
+                if semantic_dimensions is None:
+                    semantic_dimensions = segment_dimensions
+                elif (
+                    segment_dimensions is not None
+                    and semantic_dimensions != segment_dimensions
+                ):
+                    raise RuntimeError(
+                        "As raízes e os segmentos semânticos possuem dimensões "
+                        "incompatíveis."
+                    )
+                semantic_model_name = semantic_model_name or segment_model_name
 
             metadata: dict[str, Any] = {
                 "schema_version": INDEX_SCHEMA_VERSION,
@@ -956,8 +1295,13 @@ def _build_index_for_layers(
                 "semantic_root_count": semantic_root_count,
                 "semantic_dimensions": semantic_dimensions,
                 "semantic_model_name": semantic_model_name,
+                "semantic_segment_count": semantic_segment_count,
+                "semantic_segment_node_count": semantic_segment_node_count,
+                "semantic_segment_profile": semantic_segment_profile,
                 "reused_semantic_root_count": reused_semantic_root_count,
                 "generated_semantic_root_count": generated_semantic_root_count,
+                "reused_semantic_segment_count": reused_semantic_segment_count,
+                "generated_semantic_segment_count": generated_semantic_segment_count,
             }
             if index_mode == "monolithic":
                 metadata["graph_bundle"] = _graph_bundle_info(graph_root)
@@ -996,9 +1340,13 @@ def _build_index_for_layers(
         semantic_root_count=semantic_root_count,
         semantic_dimensions=semantic_dimensions,
         semantic_model_name=semantic_model_name,
+        semantic_segment_count=semantic_segment_count,
+        semantic_segment_node_count=semantic_segment_node_count,
         indexed_layers=normalized_layers,
         reused_semantic_root_count=reused_semantic_root_count,
         generated_semantic_root_count=generated_semantic_root_count,
+        reused_semantic_segment_count=reused_semantic_segment_count,
+        generated_semantic_segment_count=generated_semantic_segment_count,
     )
 
 
@@ -1087,8 +1435,12 @@ def _bundle_entry_from_result(
         "semantic_root_count": result.semantic_root_count,
         "semantic_dimensions": result.semantic_dimensions,
         "semantic_model_name": result.semantic_model_name,
+        "semantic_segment_count": result.semantic_segment_count,
+        "semantic_segment_node_count": result.semantic_segment_node_count,
         "reused_semantic_root_count": result.reused_semantic_root_count,
         "generated_semantic_root_count": result.generated_semantic_root_count,
+        "reused_semantic_segment_count": result.reused_semantic_segment_count,
+        "generated_semantic_segment_count": result.generated_semantic_segment_count,
         "built_at": utc_now_iso(),
     }
 

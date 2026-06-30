@@ -13,6 +13,10 @@ from oracle_knowledge.indexing import resolve_index_source
 from oracle_knowledge.search.hybrid_search import HybridSearch, SearchConfig
 from oracle_knowledge.search.indexed_store import IndexedGraphBundleStore, IndexedGraphStore
 from oracle_knowledge.search.semantic_context import SemanticTextSelector
+from oracle_knowledge.search.semantic_documents import (
+    default_semantic_document_text,
+    rest_operation_semantic_document_text,
+)
 
 
 @dataclass(frozen=True)
@@ -57,6 +61,7 @@ class FederatedGraphSearch:
         self._searches: dict[str, HybridSearch] = {"master": self.master_search}
         self.index_store: IndexedGraphStore | IndexedGraphBundleStore | None = None
         self._rest_operation_diagnostics: dict[str, Any] = {}
+        self._semantic_inference_diagnostics: dict[str, dict[str, int]] = {}
 
         resolved_index = resolve_index_source(self.graph_dir, index_path)
         if use_index and resolved_index.is_file():
@@ -123,16 +128,7 @@ class FederatedGraphSearch:
 
     @staticmethod
     def _node_text(node: dict[str, Any]) -> str:
-        return "\n".join(
-            value
-            for value in (
-                str(node.get("title") or node.get("name") or "").strip(),
-                str(node.get("qualified_name") or "").strip(),
-                str(node.get("search_text") or "").strip(),
-                HybridSearch._context_summary_source(node),
-            )
-            if value
-        )
+        return default_semantic_document_text(node)
 
     def _semantic_top(
         self,
@@ -172,6 +168,7 @@ class FederatedGraphSearch:
         *,
         query_vector: np.ndarray | None = None,
         text_builder: Callable[[dict[str, Any]], str] | None = None,
+        layer: str | None = None,
     ) -> dict[str, list[tuple[dict[str, Any], float]]]:
         if not grouped_nodes or limit <= 0:
             return {}
@@ -187,20 +184,77 @@ class FederatedGraphSearch:
             return {group_id: [] for group_id in grouped_nodes}
 
         build_text = text_builder or self._node_text
-        documents = [build_text(node) for node in flattened]
-        if query_vector is None:
-            scores = self.semantic_text_selector.score_documents(
-                query,
-                documents,
+        score_values: list[float | None] = [None for _ in flattened]
+        missing_indexes = list(range(len(flattened)))
+
+        if (
+            layer
+            and self.index_store is not None
+            and query_vector is not None
+        ):
+            persisted_scores = self.index_store.semantic_segment_scores(
+                layer,
+                [str(node.get("id") or "") for node in flattened],
+                query_vector,
             )
-        else:
-            scores = (
-                self.semantic_text_selector
-                .score_documents_with_query_vector(
-                    query_vector,
+            missing_indexes = []
+            for index, node in enumerate(flattened):
+                node_id = str(node.get("id") or "")
+                if node_id in persisted_scores:
+                    score_values[index] = float(persisted_scores[node_id])
+                else:
+                    missing_indexes.append(index)
+
+            diagnostics = self._semantic_inference_diagnostics.setdefault(
+                layer,
+                {
+                    "persisted_candidates": 0,
+                    "live_candidates": 0,
+                    "live_batches": 0,
+                },
+            )
+            diagnostics["persisted_candidates"] += (
+                len(flattened) - len(missing_indexes)
+            )
+
+        if missing_indexes:
+            documents = [
+                build_text(flattened[index])
+                for index in missing_indexes
+            ]
+            if query_vector is None:
+                live_scores = self.semantic_text_selector.score_documents(
+                    query,
                     documents,
                 )
-            )
+            else:
+                live_scores = (
+                    self.semantic_text_selector
+                    .score_documents_with_query_vector(
+                        query_vector,
+                        documents,
+                    )
+                )
+            for index, score in zip(
+                missing_indexes,
+                live_scores,
+                strict=True,
+            ):
+                score_values[index] = float(score)
+
+            if layer:
+                diagnostics = self._semantic_inference_diagnostics.setdefault(
+                    layer,
+                    {
+                        "persisted_candidates": 0,
+                        "live_candidates": 0,
+                        "live_batches": 0,
+                    },
+                )
+                diagnostics["live_candidates"] += len(missing_indexes)
+                diagnostics["live_batches"] += 1
+
+        scores = [float(value or 0.0) for value in score_values]
 
         ranked_by_group: dict[str, list[tuple[dict[str, Any], float]]] = {
             group_id: [] for group_id in grouped_nodes
@@ -226,35 +280,7 @@ class FederatedGraphSearch:
 
     @staticmethod
     def _rest_operation_text(node: dict[str, Any]) -> str:
-        parameter_names = [
-            str(item.get("name") or "").strip()
-            for item in (node.get("parameters") or [])
-            if isinstance(item, dict) and str(item.get("name") or "").strip()
-        ][:24]
-        attribute_names = [
-            str(item.get("name") or "").strip()
-            for item in (node.get("attributes") or [])
-            if isinstance(item, dict) and str(item.get("name") or "").strip()
-        ][:32]
-        hierarchy = [
-            str(value).strip()
-            for value in (node.get("resource_hierarchy") or [])
-            if str(value).strip()
-        ]
-        description = str(node.get("description") or "").strip()[:1200]
-        return "\n".join(
-            value
-            for value in (
-                str(node.get("title") or node.get("name") or "").strip(),
-                str(node.get("method") or "").strip(),
-                str(node.get("endpoint_path") or "").strip(),
-                " ".join(hierarchy),
-                description,
-                "Parameters: " + " ".join(parameter_names) if parameter_names else "",
-                "Attributes: " + " ".join(attribute_names) if attribute_names else "",
-            )
-            if value
-        )
+        return rest_operation_semantic_document_text(node)
 
     @staticmethod
     def _matches_modules(node: dict[str, Any], module_ids: set[str] | None) -> bool:
@@ -444,6 +470,7 @@ class FederatedGraphSearch:
             columns_by_table,
             self.config.local_columns_per_table,
             query_vector=query_vector,
+            layer="physical",
         )
         for table_id, ranked in ranked_columns.items():
             for column, score in ranked:
@@ -550,6 +577,7 @@ class FederatedGraphSearch:
             columns_by_table,
             self.config.local_columns_per_table,
             query_vector=query_vector,
+            layer="physical",
         )
         for table_id, ranked in ranked_columns.items():
             for column, score in ranked:
@@ -607,6 +635,7 @@ class FederatedGraphSearch:
                 questions_by_subject,
                 self.config.local_questions_per_subject_area,
                 query_vector=query_vector,
+                layer="otbi_analytics",
             )
             for ranked in ranked_questions.values():
                 for question, score in ranked:
@@ -636,6 +665,7 @@ class FederatedGraphSearch:
             questions_by_subject,
             self.config.local_questions_per_subject_area,
             query_vector=query_vector,
+            layer="otbi_analytics",
         )
         for ranked in ranked_questions.values():
             for question, score in ranked:
@@ -713,6 +743,7 @@ class FederatedGraphSearch:
                 self.config.local_operations_per_resource,
                 query_vector=query_vector,
                 text_builder=self._rest_operation_text,
+                layer="rest",
             )
             for ranked in ranked_operations.values():
                 for operation, score in ranked:
@@ -743,6 +774,7 @@ class FederatedGraphSearch:
             self.config.local_operations_per_resource,
             query_vector=query_vector,
             text_builder=self._rest_operation_text,
+            layer="rest",
         )
         for ranked in ranked_operations.values():
             for operation, score in ranked:
@@ -777,6 +809,7 @@ class FederatedGraphSearch:
         total_started = time.perf_counter()
         timings: dict[str, float] = {}
         self._rest_operation_diagnostics = {}
+        self._semantic_inference_diagnostics = {}
 
         def complete_stage(name: str, started: float) -> None:
             elapsed = time.perf_counter() - started
@@ -900,6 +933,9 @@ class FederatedGraphSearch:
             "semantic_fallback_roots": fallback,
             "candidate_count": len(results),
             "rest_operation_diagnostics": self._rest_operation_diagnostics,
+            "semantic_inference_diagnostics": (
+                self._semantic_inference_diagnostics
+            ),
             "timings_seconds": timings,
         }
         return payload

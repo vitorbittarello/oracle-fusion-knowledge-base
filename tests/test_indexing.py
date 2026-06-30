@@ -315,6 +315,17 @@ class SearchIndexTest(unittest.TestCase):
             )
             self.assertEqual(total_reused, 1)
             self.assertEqual(total_generated, 1)
+            physical_entry = result.indexes["physical"]
+            self.assertEqual(physical_entry["semantic_segment_node_count"], 1)
+            self.assertEqual(physical_entry["semantic_segment_count"], 1)
+            self.assertEqual(
+                physical_entry["reused_semantic_segment_count"],
+                1,
+            )
+            self.assertEqual(
+                physical_entry["generated_semantic_segment_count"],
+                0,
+            )
             self.assertEqual(migration_model.document_text_count, 1)
 
             report = validate_index_bundle(

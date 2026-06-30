@@ -21,6 +21,7 @@ from oracle_knowledge.indexing import (
     INDEX_USER_VERSION,
     REQUIRED_SQL_INDEXES,
     SEMANTIC_ROOT_TYPES,
+    SEMANTIC_SEGMENT_NODE_TYPES,
     SUPPORTED_INDEX_SCHEMA_VERSIONS,
     default_index_bundle_path,
     default_index_path,
@@ -875,6 +876,26 @@ def _eligible_semantic_root_count(
     return total
 
 
+def _eligible_semantic_segment_node_count(
+    connection: sqlite3.Connection,
+) -> int:
+    total = 0
+    for layer, node_types in SEMANTIC_SEGMENT_NODE_TYPES.items():
+        placeholders = ",".join("?" for _ in node_types)
+        total += int(
+            connection.execute(
+                f"""
+                SELECT COUNT(*)
+                  FROM nodes
+                 WHERE graph_layer = ?
+                   AND node_type IN ({placeholders})
+                """,
+                [layer, *sorted(node_types)],
+            ).fetchone()[0]
+        )
+    return total
+
+
 def validate_index_database(
     index_path: str | Path | None = None,
     *,
@@ -985,7 +1006,8 @@ def validate_index_database(
         elif schema_version != INDEX_SCHEMA_VERSION:
             report.warning(
                 "INDEX_SCHEMA_VERSION",
-                "Índice legado compatível; recomenda-se migrar para o bundle por camada.",
+                "Índice legado compatível; recomenda-se reconstruir para persistir "
+                "os segmentos semânticos locais.",
                 path=path,
                 details={"current": INDEX_SCHEMA_VERSION, "actual": schema_version},
             )
@@ -997,8 +1019,22 @@ def validate_index_database(
                 details={"version": schema_version},
             )
 
+        if schema_version == INDEX_SCHEMA_VERSION:
+            if "semantic_segments" not in tables:
+                report.error(
+                    "INDEX_SEMANTIC_SEGMENT_TABLE",
+                    "O índice atual não contém a tabela semantic_segments.",
+                    path=path,
+                )
+            else:
+                report.ok(
+                    "INDEX_SEMANTIC_SEGMENT_TABLE",
+                    "A tabela de segmentos semânticos foi encontrada.",
+                    path=path,
+                )
+
         user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        accepted_user_versions = {2, INDEX_USER_VERSION}
+        accepted_user_versions = {2, 3, INDEX_USER_VERSION}
         if user_version not in accepted_user_versions:
             report.error(
                 "INDEX_USER_VERSION",
@@ -1023,7 +1059,10 @@ def validate_index_database(
                 "SELECT name FROM sqlite_master WHERE type = 'index'"
             )
         }
-        missing_indexes = sorted(REQUIRED_SQL_INDEXES - sql_indexes)
+        required_sql_indexes = set(REQUIRED_SQL_INDEXES)
+        if schema_version != INDEX_SCHEMA_VERSION:
+            required_sql_indexes.discard("idx_semantic_segments_model")
+        missing_indexes = sorted(required_sql_indexes - sql_indexes)
         if missing_indexes:
             report.error(
                 "INDEX_SQL_INDEXES",
@@ -1036,7 +1075,7 @@ def validate_index_database(
                 "INDEX_SQL_INDEXES",
                 "Índices SQL obrigatórios encontrados.",
                 path=path,
-                details={"count": len(REQUIRED_SQL_INDEXES)},
+                details={"count": len(required_sql_indexes)},
             )
 
         counts = {
@@ -1046,6 +1085,12 @@ def validate_index_database(
             "nodes_fts": int(connection.execute("SELECT COUNT(*) FROM nodes_fts").fetchone()[0]),
             "semantic_roots": int(connection.execute("SELECT COUNT(*) FROM semantic_roots").fetchone()[0]),
         }
+        if "semantic_segments" in tables:
+            counts["semantic_segments"] = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM semantic_segments"
+                ).fetchone()[0]
+            )
         declared_counts = {
             "nodes": metadata.get("node_count"),
             "edges": metadata.get("edge_count"),
@@ -1053,6 +1098,10 @@ def validate_index_database(
             "nodes_fts": metadata.get("fts_row_count"),
             "semantic_roots": metadata.get("semantic_root_count"),
         }
+        if "semantic_segments" in counts:
+            declared_counts["semantic_segments"] = metadata.get(
+                "semantic_segment_count"
+            )
         mismatches = {
             key: {"declared": declared_counts[key], "actual": actual}
             for key, actual in counts.items()
@@ -1118,6 +1167,66 @@ def validate_index_database(
                 details={"eligible": eligible_semantic_roots, "indexed": counts["semantic_roots"]},
             )
 
+        if "semantic_segments" in tables:
+            semantic_segment_node_count = int(
+                connection.execute(
+                    "SELECT COUNT(DISTINCT node_pk) FROM semantic_segments"
+                ).fetchone()[0]
+            )
+            eligible_segment_nodes = _eligible_semantic_segment_node_count(
+                connection
+            )
+            declared_segment_nodes = metadata.get(
+                "semantic_segment_node_count"
+            )
+            if declared_segment_nodes != semantic_segment_node_count:
+                report.error(
+                    "INDEX_SEMANTIC_SEGMENT_NODE_COUNT",
+                    "A quantidade de nós com segmentos diverge dos metadados.",
+                    path=path,
+                    details={
+                        "declared": declared_segment_nodes,
+                        "actual": semantic_segment_node_count,
+                    },
+                )
+            elif counts.get("semantic_segments", 0) == 0:
+                report.warning(
+                    "INDEX_SEMANTIC_SEGMENT_COVERAGE",
+                    "O índice foi construído sem segmentos semânticos persistidos.",
+                    path=path,
+                    details={"eligible_nodes": eligible_segment_nodes},
+                )
+            elif semantic_segment_node_count == eligible_segment_nodes:
+                report.ok(
+                    "INDEX_SEMANTIC_SEGMENT_COVERAGE",
+                    "Todos os candidatos locais elegíveis possuem segmentos "
+                    "semânticos persistidos.",
+                    path=path,
+                    details={
+                        "eligible_nodes": eligible_segment_nodes,
+                        "indexed_nodes": semantic_segment_node_count,
+                        "segments": counts.get("semantic_segments", 0),
+                        "reused": metadata.get(
+                            "reused_semantic_segment_count",
+                            0,
+                        ),
+                        "generated": metadata.get(
+                            "generated_semantic_segment_count",
+                            0,
+                        ),
+                    },
+                )
+            else:
+                report.error(
+                    "INDEX_SEMANTIC_SEGMENT_COVERAGE",
+                    "A cobertura dos segmentos semânticos locais está incompleta.",
+                    path=path,
+                    details={
+                        "eligible_nodes": eligible_segment_nodes,
+                        "indexed_nodes": semantic_segment_node_count,
+                    },
+                )
+
         invalid_semantic_vectors = int(
             connection.execute(
                 """
@@ -1142,6 +1251,32 @@ def validate_index_database(
                 path=path,
                 details={"count": counts["semantic_roots"]},
             )
+
+        if "semantic_segments" in tables:
+            invalid_segment_vectors = int(
+                connection.execute(
+                    """
+                    SELECT COUNT(*)
+                      FROM semantic_segments
+                     WHERE dimensions <= 0
+                        OR length(embedding) != dimensions * 4
+                    """
+                ).fetchone()[0]
+            )
+            if invalid_segment_vectors:
+                report.error(
+                    "INDEX_SEMANTIC_SEGMENT_VECTOR_SHAPE",
+                    "Existem segmentos semânticos com dimensão ou tamanho inválido.",
+                    path=path,
+                    details={"count": invalid_segment_vectors},
+                )
+            else:
+                report.ok(
+                    "INDEX_SEMANTIC_SEGMENT_VECTOR_SHAPE",
+                    "Os segmentos semânticos persistidos possuem tamanho consistente.",
+                    path=path,
+                    details={"count": counts.get("semantic_segments", 0)},
+                )
 
         try:
             connection.execute(

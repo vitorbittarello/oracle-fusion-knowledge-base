@@ -381,32 +381,9 @@ class SemanticTextSelector:
                 or self.config.candidate_top_segments
             ),
         )
-        all_segments: list[str] = []
-        document_segment_indexes: list[list[int]] = []
-
-        for document in documents:
-            normalized = re.sub(
-                r"\s+",
-                " ",
-                document or "",
-            ).strip()
-
-            if not normalized:
-                document_segment_indexes.append([])
-                continue
-
-            segments = self._split_text(normalized)
-
-            if not segments:
-                segments = [normalized]
-
-            indexes: list[int] = []
-
-            for segment in segments:
-                indexes.append(len(all_segments))
-                all_segments.append(segment)
-
-            document_segment_indexes.append(indexes)
+        all_segments, document_segment_indexes = self.prepare_document_segments(
+            documents
+        )
 
         if not all_segments:
             return [0.0 for _ in documents]
@@ -433,6 +410,45 @@ class SemanticTextSelector:
             )
 
         return document_scores
+
+    def prepare_document_segments(
+        self,
+        documents: list[str | None],
+    ) -> tuple[list[str], list[list[int]]]:
+        """
+        Segmenta documentos usando exatamente a mesma regra do reranking.
+
+        O método é público para que o processo de indexação possa persistir os
+        mesmos segmentos que seriam codificados durante a busca. Assim, a troca
+        entre embedding online e embedding persistido não altera a semântica da
+        pontuação.
+        """
+        all_segments: list[str] = []
+        document_segment_indexes: list[list[int]] = []
+
+        for document in documents:
+            normalized = re.sub(
+                r"\s+",
+                " ",
+                document or "",
+            ).strip()
+
+            if not normalized:
+                document_segment_indexes.append([])
+                continue
+
+            segments = self._split_text(normalized)
+            if not segments:
+                segments = [normalized]
+
+            indexes: list[int] = []
+            for segment in segments:
+                indexes.append(len(all_segments))
+                all_segments.append(segment)
+
+            document_segment_indexes.append(indexes)
+
+        return all_segments, document_segment_indexes
 
     def select_relevant_text(
         self,

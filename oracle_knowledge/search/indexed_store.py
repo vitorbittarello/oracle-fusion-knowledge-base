@@ -53,6 +53,12 @@ class IndexedGraphStore:
         self.connection.row_factory = sqlite3.Row
         self.semantic_text_selector = semantic_text_selector or SemanticTextSelector()
         self.metadata = read_index_metadata(self.connection)
+        self._tables = {
+            str(row[0])
+            for row in self.connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
         self._validate_compatibility()
 
     def close(self) -> None:
@@ -106,6 +112,13 @@ class IndexedGraphStore:
     @property
     def has_semantic_roots(self) -> bool:
         return bool(self.metadata.get("semantic_root_count"))
+
+    @property
+    def has_semantic_segments(self) -> bool:
+        return (
+            "semantic_segments" in self._tables
+            and bool(self.metadata.get("semantic_segment_count"))
+        )
 
     @staticmethod
     def _decode_node(row: sqlite3.Row) -> dict[str, Any]:
@@ -232,6 +245,86 @@ class IndexedGraphStore:
 
         ranked = sorted(best, key=lambda item: (-item[0], item[1]))
         return [(node, score) for score, _, node in ranked]
+
+    def semantic_segment_scores(
+        self,
+        layer: str,
+        node_ids: Iterable[str],
+        query_vector: np.ndarray,
+        *,
+        top_segments: int | None = None,
+    ) -> dict[str, float]:
+        """Pontua nós usando os segmentos persistidos no SQLite."""
+        identifiers = list(
+            dict.fromkeys(str(value) for value in node_ids if str(value))
+        )
+        if (
+            not identifiers
+            or query_vector.size == 0
+            or not self.has_semantic_segments
+        ):
+            return {}
+
+        requested_top_segments = max(
+            1,
+            int(
+                top_segments
+                or self.semantic_text_selector.config.candidate_top_segments
+            ),
+        )
+        model_name = str(
+            self.metadata.get("semantic_model_name")
+            or self.semantic_text_selector.config.model_name
+            or ""
+        )
+        scores_by_node: dict[str, list[float]] = {}
+
+        for chunk in self._chunks(identifiers):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.connection.execute(
+                f"""
+                SELECT n.node_id,
+                       s.segment_index,
+                       s.dimensions,
+                       s.embedding
+                  FROM semantic_segments s
+                  JOIN nodes n ON n.node_pk = s.node_pk
+                 WHERE n.graph_layer = ?
+                   AND n.node_id IN ({placeholders})
+                   AND s.model_name = ?
+                 ORDER BY n.node_id, s.segment_index
+                """,
+                [layer, *chunk, model_name],
+            ).fetchall()
+
+            valid_rows: list[sqlite3.Row] = []
+            vectors: list[np.ndarray] = []
+            for row in rows:
+                dimensions = int(row["dimensions"])
+                vector = np.frombuffer(row["embedding"], dtype="<f4")
+                if vector.size != dimensions or dimensions != query_vector.size:
+                    continue
+                valid_rows.append(row)
+                vectors.append(vector)
+
+            if not vectors:
+                continue
+
+            matrix = np.vstack(vectors)
+            values = matrix @ query_vector
+            for row, value in zip(valid_rows, values, strict=True):
+                scores_by_node.setdefault(str(row["node_id"]), []).append(
+                    float(value)
+                )
+
+        return {
+            node_id: (
+                sum(sorted(values, reverse=True)[:requested_top_segments])
+                / min(len(values), requested_top_segments)
+            )
+            for node_id, values in scores_by_node.items()
+            if values
+        }
 
     def fts_roots(
         self,
@@ -589,6 +682,21 @@ class IndexedGraphBundleStore:
             module_ids=module_ids,
             limit=limit,
             query_vector=query_vector,
+        )
+
+    def semantic_segment_scores(
+        self,
+        layer: str,
+        node_ids: Iterable[str],
+        query_vector: np.ndarray,
+        *,
+        top_segments: int | None = None,
+    ) -> dict[str, float]:
+        return self._store(layer).semantic_segment_scores(
+            layer,
+            node_ids,
+            query_vector,
+            top_segments=top_segments,
         )
 
     def fts_roots(
