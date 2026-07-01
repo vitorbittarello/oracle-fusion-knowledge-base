@@ -34,6 +34,61 @@ FLEXFIELD_MARKERS = (
 SAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
+def _projection_resource_names(payload: dict[str, Any]) -> set[str]:
+    values = payload.get("resources")
+    if not isinstance(values, list):
+        return set()
+    result: set[str] = set()
+    for value in values:
+        if isinstance(value, str):
+            name = value.strip()
+        elif isinstance(value, dict):
+            name = str(value.get("name") or value.get("resource_name") or "").strip()
+        else:
+            name = ""
+        if name:
+            result.add(name)
+    return result
+
+
+def _write_module_projections(
+    root: Path,
+    resources: list[dict[str, Any]],
+    *,
+    generated_at: str,
+) -> None:
+    modules_dir = root / "modules"
+    modules_dir.mkdir(parents=True, exist_ok=True)
+
+    classified: set[str] = set()
+    for path in modules_dir.glob("*.json"):
+        if path.stem.casefold() == "unclassified":
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            classified.update(_projection_resource_names(payload))
+
+    available = {
+        str(resource.get("name") or "").strip()
+        for resource in resources
+        if str(resource.get("name") or "").strip()
+    }
+    unclassified = sorted(available - classified, key=str.casefold)
+    write_json(
+        modules_dir / "unclassified.json",
+        {
+            "version": "1.0.0",
+            "generated_at": generated_at,
+            "module_id": "unclassified",
+            "resources": unclassified,
+            "stats": {"resources": len(unclassified)},
+        },
+    )
+
+
 def _safe_filename(value: str) -> str:
     candidate = SAFE_FILENAME_RE.sub("_", value).strip("._")
     return candidate or "resource"
@@ -210,8 +265,8 @@ class AdfMetadataCollector:
         api_version: str = "latest",
         accept_language: str = "en-US",
         delay_seconds: float = 0.15,
-        timeout_connect: int = 10,
-        timeout_read: int = 120,
+        timeout_connect: int = 60,
+        timeout_read: int = 600,
         verify_ssl: bool = True,
         session: requests.Session | None = None,
     ):
@@ -499,7 +554,7 @@ class AdfMetadataCollector:
             "flexfield_children": flexfield_child_count,
         }
         normalized_catalog = {
-            "version": "1.0.0",
+            "version": "1.1.0",
             "generated_at": utc_now_iso(),
             "source": source,
             "selection": {
@@ -515,7 +570,7 @@ class AdfMetadataCollector:
             "stats": stats,
         }
         manifest = {
-            "version": "1.0.0",
+            "version": "1.1.0",
             "generated_at": normalized_catalog["generated_at"],
             "source": source,
             "selection": normalized_catalog["selection"],
@@ -527,6 +582,15 @@ class AdfMetadataCollector:
             },
             "errors": errors,
         }
+        _write_module_projections(
+            root,
+            normalized_resources,
+            generated_at=normalized_catalog["generated_at"],
+        )
+        manifest["files"]["modules_dir"] = str((root / "modules").resolve())
+        manifest["files"]["unclassified"] = str(
+            (root / "modules" / "unclassified.json").resolve()
+        )
         write_json(root / "catalog.json", normalized_catalog)
         write_json(root / "manifest.json", manifest)
         return normalized_catalog

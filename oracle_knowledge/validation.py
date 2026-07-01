@@ -45,7 +45,6 @@ MODULE_SOURCE_FILES: dict[str, tuple[str, str, str]] = {
     "functional": ("functional_fragments", "functional/fragments.jsonl", "jsonl"),
     "otbi": ("otbi_catalog", "otbi/catalog.json", "json"),
     "rest": ("rest_catalog", "rest/catalog.json", "json"),
-    "adf": ("adf_catalog", "environment/adf/catalog.json", "json"),
 }
 
 MOJIBAKE_MARKERS = ("├", "┬", "�")
@@ -473,27 +472,128 @@ def validate_module_directory(module_dir: str | Path) -> ValidationReport:
             "stats": payload.get("stats") if isinstance(payload, dict) else None,
         }
 
-    adf_source = collected_sources.get("adf") or {}
-    if adf_source.get("expected"):
-        adf_manifest_path = root / "environment" / "adf" / "manifest.json"
-        manifest_payload = _validate_json_file(
-            report,
-            adf_manifest_path,
-            required=True,
-            code_prefix="MODULE_ADF_MANIFEST",
-        )
-        if manifest_payload is not None and not isinstance(manifest_payload, dict):
-            report.error(
-                "MODULE_ADF_MANIFEST_STRUCTURE",
-                "O manifesto ADF deve conter um objeto JSON.",
-                path=adf_manifest_path,
-            )
-
     report.metadata = {
         "module_id": metadata.get("module_id"),
         "module_name": metadata.get("module_name"),
         "release": metadata.get("release"),
         "sources": collected_sources,
+    }
+    return report
+
+
+def validate_adf_environment(adf_dir: str | Path) -> ValidationReport:
+    root = Path(adf_dir).resolve()
+    report = ValidationReport("adf_environment", str(root))
+
+    if not root.is_dir():
+        report.error(
+            "ADF_DIRECTORY_MISSING",
+            "Diretório global do catálogo ADF não encontrado.",
+            path=root,
+        )
+        return report
+
+    catalog_path = root / "catalog.json"
+    manifest_path = root / "manifest.json"
+    catalog = _validate_json_file(
+        report, catalog_path, required=True, code_prefix="ADF_CATALOG"
+    )
+    manifest = _validate_json_file(
+        report, manifest_path, required=True, code_prefix="ADF_MANIFEST"
+    )
+
+    resources: list[dict[str, Any]] = []
+    if isinstance(catalog, dict):
+        values = catalog.get("resources")
+        if isinstance(values, list):
+            resources = [value for value in values if isinstance(value, dict)]
+            report.ok(
+                "ADF_RESOURCES",
+                "Recursos ADF normalizados encontrados.",
+                path=catalog_path,
+                details={"resources": len(resources)},
+            )
+        else:
+            report.error(
+                "ADF_RESOURCES_STRUCTURE",
+                "catalog.json deve conter uma lista resources.",
+                path=catalog_path,
+            )
+
+    names = [str(resource.get("name") or "").strip() for resource in resources]
+    names = [name for name in names if name]
+    duplicate_count, duplicate_sample = _duplicates(names)
+    if duplicate_count:
+        report.error(
+            "ADF_RESOURCE_DUPLICATES",
+            "Há recursos ADF duplicados no catálogo.",
+            path=catalog_path,
+            details={"count": duplicate_count, "sample": duplicate_sample},
+        )
+
+    modules_dir = root / "modules"
+    if not modules_dir.is_dir():
+        report.warning(
+            "ADF_MODULES_MISSING",
+            "Diretório de classificação por módulo ainda não existe.",
+            path=modules_dir,
+        )
+    else:
+        known = set(names)
+        unknown: dict[str, list[str]] = {}
+        projection_count = 0
+        for projection_path in sorted(modules_dir.glob("*.json")):
+            projection = _validate_json_file(
+                report,
+                projection_path,
+                required=True,
+                code_prefix="ADF_MODULE_PROJECTION",
+            )
+            if not isinstance(projection, dict):
+                continue
+            projection_count += 1
+            values = projection.get("resources")
+            if not isinstance(values, list):
+                report.error(
+                    "ADF_MODULE_RESOURCES_STRUCTURE",
+                    "A projeção deve conter uma lista resources.",
+                    path=projection_path,
+                )
+                continue
+            projection_names = []
+            for value in values:
+                if isinstance(value, str):
+                    name = value.strip()
+                elif isinstance(value, dict):
+                    name = str(value.get("name") or value.get("resource_name") or "").strip()
+                else:
+                    name = ""
+                if name:
+                    projection_names.append(name)
+            missing = sorted(set(projection_names) - known, key=str.casefold)
+            if missing:
+                unknown[str(projection_path)] = missing[:20]
+
+        if unknown:
+            report.error(
+                "ADF_MODULE_UNKNOWN_RESOURCES",
+                "Há projeções de módulo apontando para recursos ausentes do catálogo.",
+                details={"files": unknown},
+            )
+        else:
+            report.ok(
+                "ADF_MODULE_PROJECTIONS",
+                "Projeções por módulo são consistentes com o catálogo global.",
+                path=modules_dir,
+                details={"files": projection_count},
+            )
+
+    report.metadata = {
+        "environment_host": (catalog or {}).get("source", {}).get("environment_host")
+        if isinstance(catalog, dict)
+        else None,
+        "resources": len(resources),
+        "manifest_stats": manifest.get("stats") if isinstance(manifest, dict) else None,
     }
     return report
 

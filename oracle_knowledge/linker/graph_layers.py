@@ -43,6 +43,7 @@ PHYSICAL_NODE_TYPES = {
 REST_NODE_TYPES = {
     "rest_resource",
     "rest_operation",
+    "adf_resource",
 }
 
 OTBI_ANALYTICS_NODE_TYPES = {
@@ -56,6 +57,7 @@ MASTER_EDGE_TYPES = {
     "mapped_to_attribute",
     "uses_table",
     "uses_column",
+    "environment_variant_of",
 }
 
 EXCLUDED_EDGE_TYPES = {
@@ -355,7 +357,7 @@ def clean_node_search_text(node: dict[str, Any]) -> str:
             ]
         )
 
-    elif node_type.startswith("rest_"):
+    elif node_type.startswith("rest_") or node_type == "adf_resource":
         values.extend(
             [
                 node.get("description"),
@@ -364,18 +366,25 @@ def clean_node_search_text(node: dict[str, Any]) -> str:
                 node.get("parent_resource"),
                 node.get("endpoint_path"),
                 node.get("method"),
+                node.get("title_plural"),
             ]
         )
         values.extend(
             _dict_texts(
                 node.get("parameters") or [],
-                keys=("name", "description", "type"),
+                keys=("name", "title", "description", "type"),
             )
         )
         values.extend(
             _dict_texts(
                 node.get("attributes") or [],
-                keys=("name", "description", "type"),
+                keys=("name", "title", "description", "type"),
+            )
+        )
+        values.extend(
+            _dict_texts(
+                node.get("children") or [],
+                keys=("name", "title", "description", "type"),
             )
         )
 
@@ -530,6 +539,18 @@ def build_graph_bundle_from_graph(graph: dict[str, Any]) -> dict[str, dict[str, 
         if source not in master_seed_ids and target not in master_seed_ids:
             continue
         master_edges.append(edge)
+        master_ids.add(source)
+        master_ids.add(target)
+
+    for edge in clean_edges:
+        if edge.get("type") != "environment_variant_of":
+            continue
+        source = edge["source"]
+        target = edge["target"]
+        if source not in master_ids and target not in master_ids:
+            continue
+        if edge not in master_edges:
+            master_edges.append(edge)
         master_ids.add(source)
         master_ids.add(target)
 

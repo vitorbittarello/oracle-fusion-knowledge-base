@@ -23,7 +23,7 @@ from oracle_knowledge.search.semantic_context import SemanticTextSelector
 ROOT_NODE_TYPES = {
     "physical": {"physical_table"},
     "otbi_analytics": {"otbi_subject_area"},
-    "rest": {"rest_resource"},
+    "rest": {"rest_resource", "adf_resource"},
 }
 
 

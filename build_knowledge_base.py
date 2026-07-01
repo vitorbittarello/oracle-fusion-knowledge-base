@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,7 @@ from oracle_knowledge.validation import (
     ValidationReport,
     render_validation_report,
     validate_environment,
+    validate_adf_environment,
     validate_graph_directory,
     validate_index_bundle,
     validate_index_database,
@@ -61,6 +63,7 @@ DEFAULT_REST = ROOT / "data" / "rest" / "rest_catalog.json"
 DEFAULT_GRAPH = ROOT / "data" / "graph" / "knowledge_graph.json"
 DEFAULT_PHYSICAL = ROOT / "data" / "physical" / "antigravity_oracle_fusion_scraped_skills.json"
 DEFAULT_MODULES_ROOT = ROOT / "data" / "modules"
+DEFAULT_ADF_ENVIRONMENT = ROOT / "data" / "environment" / "adf"
 DEFAULT_CACHE = ROOT / ".cache" / "oracle_docs"
 
 
@@ -138,13 +141,17 @@ def build_parser() -> argparse.ArgumentParser:
     adf.add_argument(
         "--module-dir",
         help=(
-            "Diretório do módulo. Quando informado, grava em "
-            "environment/adf e atualiza module.json."
+            "Compatibilidade temporária: infere data/environment/adf a partir "
+            "do diretório do módulo e migra a coleta antiga, quando necessário."
         ),
     )
     adf.add_argument(
         "--output-dir",
-        help="Diretório explícito de saída. Não use junto com --module-dir.",
+        default=str(DEFAULT_ADF_ENVIRONMENT),
+        help=(
+            "Diretório global do catálogo ADF do ambiente. "
+            "Padrão: data/environment/adf."
+        ),
     )
     adf.add_argument("--api-root", default="fscmRestApi")
     adf.add_argument("--api-version", default="latest")
@@ -191,6 +198,15 @@ def build_parser() -> argparse.ArgumentParser:
     link.add_argument("--functional-fragments", action="append", default=[])
     link.add_argument("--otbi-catalog", action="append", default=[])
     link.add_argument("--rest-catalog", action="append", default=[])
+    link.add_argument(
+        "--adf-catalog",
+        action="append",
+        default=[],
+        help=(
+            "Catálogo ADF global do ambiente. Pode ser repetido. Quando omitido, "
+            "o linker procura data/environment/adf/catalog.json ao lado de data/modules."
+        ),
+    )
     link.add_argument("--validated-rules", action="append", default=[])
     link.add_argument("--entity-aliases", action="append", default=[])
     link.add_argument(
@@ -415,6 +431,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    validate_adf = subparsers.add_parser(
+        "validate-adf",
+        help="Valida o catálogo ADF global e suas projeções por módulo.",
+    )
+    validate_adf.add_argument(
+        "--adf-dir",
+        default=str(DEFAULT_ADF_ENVIRONMENT),
+    )
+    validate_adf.add_argument(
+        "--json-output",
+        nargs="?",
+        const="-",
+        help=(
+            "Produz o relatório em JSON. Sem caminho, escreve no stdout; "
+            "com caminho, grava o arquivo informado."
+        ),
+    )
+
     validate_graph = subparsers.add_parser(
         "validate-graph",
         help="Valida o bundle, os grafos, as estatísticas e as arestas.",
@@ -476,8 +510,6 @@ def _module_paths(output_dir: str | Path) -> dict[str, Path]:
         "functional": root / "functional" / "fragments.jsonl",
         "otbi": root / "otbi" / "catalog.json",
         "rest": root / "rest" / "catalog.json",
-        "adf_manifest": root / "environment" / "adf" / "manifest.json",
-        "adf_catalog": root / "environment" / "adf" / "catalog.json",
         "rules": root / "rules" / "validated_rules.json",
         "entities": root / "config" / "entity_aliases.json",
     }
@@ -643,15 +675,18 @@ def collect_rest(args: argparse.Namespace) -> None:
 
 
 def collect_adf(args: argparse.Namespace) -> None:
-    if bool(args.module_dir) == bool(args.output_dir):
-        raise SystemExit("Informe exatamente um entre --module-dir e --output-dir.")
+    output_dir = Path(args.output_dir or DEFAULT_ADF_ENVIRONMENT).resolve()
 
-    module_dir = Path(args.module_dir).resolve() if args.module_dir else None
-    output_dir = (
-        module_dir / "environment" / "adf"
-        if module_dir is not None
-        else Path(args.output_dir).resolve()
-    )
+    if args.module_dir:
+        module_dir = Path(args.module_dir).resolve()
+        inferred_output = module_dir.parent.parent / "environment" / "adf"
+        legacy_output = module_dir / "environment" / "adf"
+        output_dir = inferred_output.resolve()
+
+        if legacy_output.exists() and not output_dir.exists():
+            output_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(legacy_output), str(output_dir))
+            print(f"[ADF] Layout antigo migrado para {output_dir}")
 
     username = args.username or os.getenv(args.username_env)
     password = os.getenv(args.password_env)
@@ -697,27 +732,6 @@ def collect_adf(args: argparse.Namespace) -> None:
         force_refresh=args.force_refresh,
     )
 
-    if module_dir is not None:
-        metadata_path = module_dir / "module.json"
-        if not metadata_path.is_file():
-            raise SystemExit(f"module.json não encontrado: {metadata_path}")
-        metadata = read_json(metadata_path, {})
-        if not isinstance(metadata, dict):
-            raise SystemExit(f"module.json inválido: {metadata_path}")
-        source_urls = metadata.get("source_urls")
-        if not isinstance(source_urls, dict):
-            source_urls = {}
-            metadata["source_urls"] = source_urls
-        outputs = metadata.get("outputs")
-        if not isinstance(outputs, dict):
-            outputs = {}
-            metadata["outputs"] = outputs
-        source_urls["adf"] = args.base_url.rstrip("/")
-        outputs["adf_manifest"] = str((output_dir / "manifest.json").resolve())
-        outputs["adf_catalog"] = str((output_dir / "catalog.json").resolve())
-        metadata["generated_at"] = utc_now_iso()
-        write_json(metadata_path, metadata)
-
     print(f"[ADF] {payload['stats']} gravado em {output_dir}")
 
 
@@ -761,6 +775,7 @@ def _discover_sources(args: argparse.Namespace) -> dict[str, list[str]]:
         "functional": list(args.functional_fragments),
         "otbi": list(args.otbi_catalog),
         "rest": list(args.rest_catalog),
+        "adf": list(args.adf_catalog),
         "rules": list(args.validated_rules),
         "entities": list(args.entity_aliases),
     }
@@ -774,6 +789,17 @@ def _discover_sources(args: argparse.Namespace) -> dict[str, list[str]]:
         sources["rest"].append(paths["rest"])
         sources["rules"].append(paths["rules"])
         sources["entities"].append(paths["entities"])
+
+    if args.modules_root:
+        modules_root = Path(args.modules_root).resolve()
+        sources["adf"].append(
+            modules_root.parent / "environment" / "adf" / "catalog.json"
+        )
+    else:
+        for module_dir in module_dirs:
+            sources["adf"].append(
+                module_dir.parent.parent / "environment" / "adf" / "catalog.json"
+            )
 
     if args.include_default_curation:
         if DEFAULT_RULES.exists():
@@ -800,6 +826,7 @@ def link_graph(args: argparse.Namespace) -> None:
         "functional_fragments": sources["functional"],
         "otbi_catalog": sources["otbi"],
         "rest_catalog": sources["rest"],
+        "adf_catalog": sources["adf"],
         "validated_rules": sources["rules"],
         "entity_aliases": sources["entities"],
     }
@@ -1019,6 +1046,13 @@ def run_validate_module(args: argparse.Namespace) -> None:
     )
 
 
+def run_validate_adf(args: argparse.Namespace) -> None:
+    _emit_validation_report(
+        validate_adf_environment(args.adf_dir),
+        args.json_output,
+    )
+
+
 def run_validate_index(args: argparse.Namespace) -> None:
     index_path = resolve_index_source(args.graph_dir, args.index)
     if index_path.suffix.casefold() == ".json":
@@ -1083,6 +1117,8 @@ def main() -> None:
         run_doctor(args)
     elif args.command == "validate-module":
         run_validate_module(args)
+    elif args.command == "validate-adf":
+        run_validate_adf(args)
     elif args.command == "validate-graph":
         run_validate_graph(args)
     elif args.command == "validate-result":

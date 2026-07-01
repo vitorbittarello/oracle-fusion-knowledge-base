@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 
 from bs4 import BeautifulSoup
@@ -227,6 +228,14 @@ class AdfMetadataCollectorTest(unittest.TestCase):
             self.assertTrue((root / "catalog.json").is_file())
             self.assertTrue(
                 (root / "raw/resources/APCUSTOMBM_c.json").is_file()
+            )
+            self.assertTrue((root / "modules/unclassified.json").is_file())
+            unclassified = json.loads(
+                (root / "modules/unclassified.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                unclassified["resources"],
+                ["APCUSTOMBM_c", "purchaseOrders"],
             )
 
             custom = next(

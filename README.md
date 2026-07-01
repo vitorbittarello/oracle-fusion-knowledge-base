@@ -1631,67 +1631,76 @@ Em ambientes sem CUDA, omita `--semantic-device cuda`. O rebuild seletivo por ca
 
 ## Coleta automatizada de metadados ADF do ambiente
 
-O comando `collect-adf` consulta o catálogo `/describe` do ambiente Fusion e,
-sem navegação manual, coleta o `describe` de cada recurso selecionado. Os
-arquivos ficam separados da documentação oficial em
-`environment/adf`, pois representam a configuração efetivamente publicada no
-ambiente.
+O catálogo ADF pertence ao ambiente Fusion inteiro. Ele não é armazenado dentro
+de um módulo. O comando `collect-adf` consulta o `/describe` global e coleta os
+recursos selecionados em:
 
-No PowerShell, defina o usuário e informe a senha apenas quando o comando
-solicitar:
+```text
+data/environment/adf/
+├── manifest.json
+├── catalog.json
+├── raw/
+│   ├── catalog.json
+│   ├── catalog.meta.json
+│   └── resources/
+└── modules/
+    ├── unclassified.json
+    ├── procurement.json
+    └── <outro_modulo>.json
+```
+
+As credenciais são fornecidas por variáveis de ambiente. O comando não solicita
+senha interativamente:
 
 ```powershell
 $env:FUSION_USERNAME = "seu.usuario"
+$env:FUSION_PASSWORD = "senha-do-processo-atual"
 
 python build_knowledge_base.py collect-adf `
   --base-url "https://seu-ambiente.fa.regiao.oraclecloud.com" `
-  --module-dir ".\data\modules\procurement"
+  --output-dir ".\data\environment\adf" `
+  --custom-only
 ```
-
-Para uma execução não interativa, a senha pode ser fornecida pela variável de
-ambiente `FUSION_PASSWORD`. Também é possível usar um token OAuth na variável
-`FUSION_BEARER_TOKEN`.
 
 A coleta é retomável. Recursos já gravados em `raw/resources` não são
-consultados novamente, salvo quando `--force-refresh` é informado.
+consultados novamente, salvo quando `--force-refresh` é informado. O arquivo
+`modules/unclassified.json` é atualizado sem sobrescrever classificações
+manuais já existentes nos demais arquivos de `modules/`.
 
-Opções úteis:
+Uma projeção explícita por módulo usa apenas os nomes dos recursos globais:
+
+```json
+{
+  "module_id": "procurement",
+  "resources": [
+    "purchaseAgreements",
+    "purchaseOrders",
+    "APCUSTOMBM_c"
+  ]
+}
+```
+
+Validação do catálogo global:
 
 ```powershell
-# Somente objetos customizados cujo nome termina em _c
-python build_knowledge_base.py collect-adf `
-  --base-url "https://seu-ambiente.fa.regiao.oraclecloud.com" `
-  --module-dir ".\data\modules\procurement" `
-  --custom-only
-
-# Apenas recursos cujo nome corresponde ao padrão
-python build_knowledge_base.py collect-adf `
-  --base-url "https://seu-ambiente.fa.regiao.oraclecloud.com" `
-  --module-dir ".\data\modules\procurement" `
-  --include-regex "purchase|supplier|agreement"
-
-# Somente o catálogo geral, sem chamar cada recurso
-python build_knowledge_base.py collect-adf `
-  --base-url "https://seu-ambiente.fa.regiao.oraclecloud.com" `
-  --module-dir ".\data\modules\procurement" `
-  --catalog-only
+python build_knowledge_base.py validate-adf `
+  --adf-dir ".\data\environment\adf"
 ```
 
-Arquivos produzidos:
+O comando `link` procura automaticamente
+`data/environment/adf/catalog.json` quando `--modules-root` aponta para
+`data/modules`:
 
-```text
-data/modules/procurement/environment/adf/
-├── manifest.json
-├── catalog.json
-└── raw/
-    ├── catalog.json
-    ├── catalog.meta.json
-    └── resources/
-        ├── <recurso>.json
-        └── <recurso>.meta.json
+```powershell
+python build_knowledge_base.py link `
+  --modules-root ".\data\modules" `
+  --include-default-curation `
+  --output-dir ".\data\graph\fusion_modules"
 ```
 
-O catálogo normalizado preserva a origem `fusion_adf_rest_metadata` e registra
-atributos, filhos, ações, links e indicadores de objetos e atributos
-customizados. Essa evidência descreve a camada de serviço publicada; ela não é
-tratada automaticamente como prova de tabela física ou de join SQL.
+Também é possível informar o catálogo explicitamente com `--adf-catalog`.
+Os recursos ADF entram no grafo REST como nós `adf_resource`, mantendo a origem
+`fusion_adf_rest_metadata`, os atributos, filhos, ações e links publicados pelo
+ambiente. Quando um recurso ADF possui exatamente o mesmo nome de um recurso
+REST oficial, o linker cria a relação explícita `environment_variant_of`.
+Essa relação não é tratada como prova de tabela física ou de join SQL.

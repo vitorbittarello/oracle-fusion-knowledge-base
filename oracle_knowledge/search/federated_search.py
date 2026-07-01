@@ -359,6 +359,17 @@ class FederatedGraphSearch:
                     if edge.get("type") in {"mapped_to_entity", "uses_table", "uses_column"}:
                         add_route(edge["target"], 0.85 + seed_score, edge["type"], entity_id)
 
+        for routed_id, routed_row in list(routed.items()):
+            for edge in outgoing.get(routed_id, []):
+                if edge.get("type") != "environment_variant_of":
+                    continue
+                add_route(
+                    edge["target"],
+                    max(0.70, float(routed_row["score"]) * 0.82),
+                    "environment_variant_of",
+                    routed_id,
+                )
+
         return business, routed, diagnostics
 
     def _fallback_roots(
@@ -381,7 +392,7 @@ class FederatedGraphSearch:
         root_types = {
             "physical": {"physical_table"},
             "otbi_analytics": {"otbi_subject_area"},
-            "rest": {"rest_resource"},
+            "rest": {"rest_resource", "adf_resource"},
         }[layer]
         nodes = [
             node for node in graph.get("nodes", [])

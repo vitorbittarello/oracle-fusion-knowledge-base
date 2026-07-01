@@ -380,6 +380,74 @@ class GraphBundleTest(unittest.TestCase):
             master_from_disk = read_json(outputs["master"], {})
             self.assertEqual(master_from_disk["graph_layer"], "master")
 
+    def test_loads_global_adf_catalog_into_rest_graph(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sources = self._write_sources(root)
+            adf_root = root / "data/environment/adf"
+            write_json(
+                adf_root / "catalog.json",
+                {
+                    "source": {
+                        "source_type": "fusion_adf_rest_metadata",
+                        "environment_host": "fusion.example.test",
+                    },
+                    "resources": [
+                        {
+                            "id": "adf:purchase-agreements",
+                            "node_type": "adf_resource",
+                            "name": "purchaseAgreements",
+                            "title": "Purchase Agreements",
+                            "attributes": [
+                                {
+                                    "name": "CustomAgreementCode_c",
+                                    "title": "Custom Agreement Code",
+                                    "description": "Implementation-specific agreement code.",
+                                    "type": "string",
+                                    "is_custom": True,
+                                }
+                            ],
+                            "children": [],
+                            "source": {
+                                "source_type": "fusion_adf_rest_metadata",
+                                "environment_host": "fusion.example.test",
+                            },
+                        }
+                    ],
+                },
+            )
+            write_json(
+                adf_root / "modules/procurement.json",
+                {
+                    "module_id": "procurement",
+                    "resources": ["purchaseAgreements"],
+                },
+            )
+
+            bundle = build_graph_bundle(
+                **sources,
+                adf_catalog=str(adf_root / "catalog.json"),
+            )
+
+            adf_nodes = [
+                node
+                for node in bundle["rest"]["nodes"]
+                if node.get("node_type") == "adf_resource"
+            ]
+            self.assertEqual(len(adf_nodes), 1)
+            self.assertEqual(adf_nodes[0]["modules"], ["procurement"])
+            self.assertIn(
+                "custom agreement code",
+                adf_nodes[0]["search_text"].lower(),
+            )
+            self.assertTrue(
+                any(
+                    edge.get("type") == "environment_variant_of"
+                    and edge.get("target") == adf_nodes[0]["id"]
+                    for edge in bundle["rest"]["edges"]
+                )
+            )
+
     def test_legacy_combined_graph_is_clean(self):
         with tempfile.TemporaryDirectory() as directory:
             sources = self._write_sources(Path(directory))

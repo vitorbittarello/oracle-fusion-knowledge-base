@@ -625,7 +625,7 @@ SEMANTIC_ROOT_TYPES = {
     "master": {"business_entity", "business_attribute", "validated_rule"},
     "physical": {"physical_table"},
     "otbi_analytics": {"otbi_subject_area"},
-    "rest": {"rest_resource"},
+    "rest": {"rest_resource", "adf_resource"},
 }
 
 SEMANTIC_SEGMENT_NODE_TYPES = {

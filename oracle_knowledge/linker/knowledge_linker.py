@@ -34,6 +34,7 @@ EDGE_WEIGHTS = {
     "answered_by": 1.0,
     "has_operation": 0.95,
     "parent_of": 0.85,
+    "environment_variant_of": 1.0,
     "mapped_to_entity": 1.0,
     "mentions_table": 0.8,
     "mentions_entity": 0.7,
@@ -80,6 +81,7 @@ class GraphBuilder:
         self.column_by_qualified_name: dict[str, str] = {}
         self.subject_area_by_name: dict[str, list[str]] = defaultdict(list)
         self.rest_resource_by_name: dict[str, list[str]] = defaultdict(list)
+        self.adf_resource_by_name: dict[str, list[str]] = defaultdict(list)
         self.entity_by_id: dict[str, str] = {}
         self.pending_relationships: list[tuple[str, dict[str, Any]]] = []
         self.loaded_sources: list[dict[str, Any]] = []
@@ -481,6 +483,92 @@ class GraphBuilder:
                 for child_id in child_ids:
                     self.add_edge(parent_id, child_id, "parent_of")
 
+    @staticmethod
+    def _adf_module_assignments(catalog_path: str | Path) -> dict[str, list[str]]:
+        modules_dir = Path(catalog_path).resolve().parent / "modules"
+        assignments: dict[str, list[str]] = defaultdict(list)
+        if not modules_dir.is_dir():
+            return assignments
+
+        for projection_path in sorted(modules_dir.glob("*.json")):
+            if projection_path.stem.casefold() == "unclassified":
+                continue
+            payload = read_json(projection_path, {})
+            if not isinstance(payload, dict):
+                continue
+            module_id = str(
+                payload.get("module_id") or projection_path.stem
+            ).strip()
+            if not module_id:
+                continue
+            values = payload.get("resources")
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                if isinstance(value, str):
+                    resource_name = value.strip()
+                elif isinstance(value, dict):
+                    resource_name = str(
+                        value.get("name") or value.get("resource_name") or ""
+                    ).strip()
+                else:
+                    resource_name = ""
+                if resource_name and module_id not in assignments[resource_name.casefold()]:
+                    assignments[resource_name.casefold()].append(module_id)
+        return assignments
+
+    def load_adf(self, path: str | None) -> None:
+        if not path:
+            return
+        payload = read_json(path, {})
+        if not isinstance(payload, dict):
+            return
+        self.loaded_sources.append({"kind": "adf", "path": str(path)})
+        assignments = self._adf_module_assignments(path)
+
+        for resource in payload.get("resources", []):
+            if not isinstance(resource, dict):
+                continue
+            resource_name = str(resource.get("name") or "").strip()
+            if not resource_name:
+                continue
+
+            key = normalize_text(resource_name)
+            rest_ids = list(self.rest_resource_by_name.get(key, []))
+            modules = list(resource.get("modules") or [])
+            modules.extend(assignments.get(resource_name.casefold(), []))
+            for rest_id in rest_ids:
+                modules.extend(self.nodes.get(rest_id, {}).get("modules") or [])
+
+            node = {
+                **resource,
+                "node_type": "adf_resource",
+                "modules": list(dict.fromkeys(str(value) for value in modules if value)),
+                "environment_scope": "fusion_instance",
+                "catalog_scope": "global",
+                "confidence": resource.get("confidence", "high"),
+                "source": {
+                    **(resource.get("source") or {}),
+                    "source_type": "fusion_adf_rest_metadata",
+                    "catalog_path": str(path),
+                },
+            }
+            node_id = self.add_node(node)
+            if node_id not in self.adf_resource_by_name[key]:
+                self.adf_resource_by_name[key].append(node_id)
+
+            for rest_id in rest_ids:
+                self.add_edge(
+                    rest_id,
+                    node_id,
+                    "environment_variant_of",
+                    evidence={
+                        "match_type": "exact_resource_name",
+                        "resource_name": resource_name,
+                        "source": "fusion_adf_rest_metadata",
+                    },
+                )
+
     def load_rules(self, path: str | None) -> None:
         if not path:
             return
@@ -845,6 +933,7 @@ def build_graph(
     functional_fragments: str | Path | Iterable[str | Path] | None = None,
     otbi_catalog: str | Path | Iterable[str | Path] | None = None,
     rest_catalog: str | Path | Iterable[str | Path] | None = None,
+    adf_catalog: str | Path | Iterable[str | Path] | None = None,
     validated_rules: str | Path | Iterable[str | Path] | None = None,
     entity_aliases: str | Path | Iterable[str | Path] | None = None,
 ) -> dict[str, Any]:
@@ -858,6 +947,8 @@ def build_graph(
         builder.load_otbi(path)
     for path in _path_list(rest_catalog):
         builder.load_rest(path)
+    for path in _path_list(adf_catalog):
+        builder.load_adf(path)
     for path in _path_list(validated_rules):
         builder.load_rules(path)
     for path in _path_list(entity_aliases):
@@ -871,6 +962,7 @@ def build_graph_bundle(
     functional_fragments: str | Path | Iterable[str | Path] | None = None,
     otbi_catalog: str | Path | Iterable[str | Path] | None = None,
     rest_catalog: str | Path | Iterable[str | Path] | None = None,
+    adf_catalog: str | Path | Iterable[str | Path] | None = None,
     validated_rules: str | Path | Iterable[str | Path] | None = None,
     entity_aliases: str | Path | Iterable[str | Path] | None = None,
 ) -> dict[str, dict[str, Any]]:
@@ -884,6 +976,8 @@ def build_graph_bundle(
         builder.load_otbi(path)
     for path in _path_list(rest_catalog):
         builder.load_rest(path)
+    for path in _path_list(adf_catalog):
+        builder.load_adf(path)
     for path in _path_list(validated_rules):
         builder.load_rules(path)
     for path in _path_list(entity_aliases):
@@ -899,6 +993,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--functional-fragments", action="append")
     parser.add_argument("--otbi-catalog", action="append")
     parser.add_argument("--rest-catalog", action="append")
+    parser.add_argument("--adf-catalog", action="append")
     parser.add_argument("--validated-rules", action="append")
     parser.add_argument("--entity-aliases", action="append")
     parser.add_argument("--output")
@@ -916,6 +1011,7 @@ def main() -> None:
         "functional_fragments": args.functional_fragments,
         "otbi_catalog": args.otbi_catalog,
         "rest_catalog": args.rest_catalog,
+        "adf_catalog": args.adf_catalog,
         "validated_rules": args.validated_rules,
         "entity_aliases": args.entity_aliases,
     }

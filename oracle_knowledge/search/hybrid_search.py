@@ -23,6 +23,7 @@ SOURCE_BOOSTS = {
     "oracle_functional_documentation": 1.20,
     "oracle_otbi_documentation": 1.17,
     "oracle_rest_documentation": 1.12,
+    "fusion_adf_rest_metadata": 1.22,
     "oracle_data_dictionary": 1.10,
     "curated_entity_map": 1.15,
 }
@@ -36,6 +37,7 @@ TYPE_BOOSTS = {
     "otbi_subject_area": 1.10,
     "rest_resource": 1.06,
     "rest_operation": 1.03,
+    "adf_resource": 1.10,
     "functional_section": 1.08,
 }
 
@@ -942,8 +944,9 @@ class HybridSearch:
 
         if (
                 node_type.startswith("rest_")
+                or node_type == "adf_resource"
                 or source_type
-                == "oracle_rest_documentation"
+                in {"oracle_rest_documentation", "fusion_adf_rest_metadata"}
         ):
             return "rest"
 
