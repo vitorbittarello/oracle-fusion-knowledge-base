@@ -1159,3 +1159,63 @@ python -u build_knowledge_base.py build-index \
 ```
 
 CUDA acelera a inferência do modelo semântico. A gravação SQLite, o FTS5, os hashes e a validação continuam na CPU. Em máquinas sem CUDA, basta omitir a opção. O suporte a GPU melhora a performance, mas não altera o conteúdo funcional do índice nem é requisito para usar o projeto.
+
+## Preparar o corpus semântico antes dos índices
+
+A etapa de normalização é executada separadamente da vetorização:
+
+```powershell
+& ".\.venv\Scripts\python.exe" -u build_knowledge_base.py normalize-index `
+  --graph-dir ".\data\graph\fusion_modules" `
+  --batch-size 1000 `
+  --checkpoint-percent 1
+```
+
+Exemplo de acompanhamento:
+
+```text
+[NORMALIZE] 45000/187793 nós (23.96%) | segmentos=81240 |
+textos únicos=21980 | deduplicados=59260 | reutilizados=12000 |
+normalizados=33000 | ETA 00:08:31 | checkpoint persistido.
+```
+
+O estado é gravado em
+`search_index/semantic_normalization.sqlite`. O manifesto legível fica em
+`search_index/semantic_normalization_manifest.json`.
+
+O mesmo comando pode ser interrompido com `Ctrl+C` e executado novamente. A
+retomada usa o ordinal do último lote confirmado e não reinicia a normalização.
+Em uma nova versão dos grafos, nós com o mesmo documento são reutilizados e
+somente conteúdos novos ou alterados são normalizados novamente.
+
+A normalização é conservadora: preserva contexto para campos de negócio e só
+compartilha conceitos técnicos explicitamente curados. A construção dos índices
+semânticos passará a consumir esse corpus em etapa posterior.
+
+## Vetorizar o corpus normalizado
+
+Após a normalização, execute:
+
+```powershell
+& ".\.venv\Scripts\python.exe" -u build_knowledge_base.py vectorize-index `
+  --graph-dir ".\data\graph\fusion_modules" `
+  --semantic-device "cpu" `
+  --semantic-batch-size 32 `
+  --checkpoint-percent 1
+```
+
+O comando consome `search_index/semantic_normalization.sqlite` e grava os
+vetores em `search_index/semantic_embeddings.sqlite`, com manifesto em
+`search_index/semantic_embeddings_manifest.json`.
+
+O perfil padrão usa `intfloat/multilingual-e5-large-instruct`, 1.024 dimensões,
+normalização L2 e persistência `float32`. Cada lote é confirmado no SQLite. Em
+caso de interrupção, execute o mesmo comando novamente para continuar dos
+textos ainda sem embedding.
+
+Exemplo de log:
+
+```text
+[VECTORIZE] 51821/259102 textos (20.00%) | gerados=51821 |
+reutilizados=0 | dimensões=1024 | ETA 07:42:10 | checkpoint persistido.
+```

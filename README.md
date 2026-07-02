@@ -194,18 +194,32 @@ Dependências principais:
 - `numpy`;
 - `sentence-transformers`.
 
-O modelo semântico padrão é:
+O modelo padrão dos comandos locais de vetorização, construção e busca é:
 
 ```text
-intfloat/multilingual-e5-large-instruct
+intfloat/multilingual-e5-base
 ```
 
-Na primeira busca semântica, o modelo pode ser baixado e carregado. A primeira execução tende a ser mais lenta.
+Os modelos suportados são:
 
-> **CUDA não é requisito.** A geração dos índices funciona integralmente em CPU. O projeto também suporta GPU NVIDIA com CUDA para acelerar a criação dos embeddings semânticos, especialmente na primeira indexação de módulos grandes.
+| Modelo | Dimensões | Formato de consulta/documento | Uso recomendado |
+|---|---:|---|---|
+| `intfloat/multilingual-e5-base` | 768 | `query:` / `passage:` | CPU local e uso individual |
+| `intfloat/multilingual-e5-large-instruct` | 1.024 | instrução E5 para consulta; documento sem prefixo | GPU NVIDIA com CUDA |
+
+Na primeira execução, o modelo selecionado pode ser baixado e carregado. O
+`multilingual-e5-base` é o padrão porque oferece um compromisso melhor para a
+execução em CPU de um catálogo grande. O `multilingual-e5-large-instruct` pode
+ser selecionado quando se desejar o perfil maior, mas sua vetorização completa
+em CPU pode levar muitas horas; para esse modelo, é recomendado utilizar uma
+GPU NVIDIA com CUDA.
+
+> **CUDA não é requisito para o modelo base.** O projeto aceita `cpu` e `cuda`
+> no caminho atual baseado em `sentence-transformers`. TPU não é suportada pela
+> implementação atual; não existe backend, configuração nem fluxo de execução
+> preparado para TPU neste projeto.
 
 ---
-
 ## 5. Instalação
 
 Crie o ambiente virtual:
@@ -1704,3 +1718,145 @@ Os recursos ADF entram no grafo REST como nós `adf_resource`, mantendo a origem
 ambiente. Quando um recurso ADF possui exatamente o mesmo nome de um recurso
 REST oficial, o linker cria a relação explícita `environment_variant_of`.
 Essa relação não é tratada como prova de tabela física ou de join SQL.
+
+## Normalização semântica retomável
+
+Antes da vetorização, o corpus semântico pode ser preparado com o comando
+`normalize-index`. Essa etapa não carrega o modelo de embeddings. Ela:
+
+- normaliza Unicode e whitespace de forma conservadora;
+- preserva caixa, acentos e pontuação;
+- deduplica textos normalizados idênticos;
+- aplica canonicalização curada somente a campos técnicos estáveis de auditoria;
+- persiste o estado em SQLite a cada lote;
+- registra checkpoint, percentual e ETA no intervalo configurado;
+- retoma automaticamente um processamento interrompido;
+- reutiliza nós cujo documento não mudou;
+- processa ADF/REST antes das demais camadas.
+
+Exemplo:
+
+```powershell
+& ".\.venv\Scripts\python.exe" -u build_knowledge_base.py normalize-index `
+  --graph-dir ".\data\graph\fusion_modules" `
+  --batch-size 1000 `
+  --checkpoint-percent 1
+```
+
+Artefatos gerados:
+
+```text
+data/graph/fusion_modules/search_index/
+├── semantic_normalization.sqlite
+└── semantic_normalization_manifest.json
+```
+
+Os lotes são confirmados em transações SQLite mesmo entre checkpoints. O
+percentual controla a frequência do manifesto e das mensagens de progresso, não
+a durabilidade. Após `Ctrl+C`, basta repetir o mesmo comando para retomar do
+último lote confirmado.
+
+Para iniciar um novo run sem apagar o cache normalizado:
+
+```powershell
+& ".\.venv\Scripts\python.exe" -u build_knowledge_base.py normalize-index `
+  --graph-dir ".\data\graph\fusion_modules" `
+  --no-resume
+```
+
+A normalização possui versão própria. Campos genéricos como `STATUS`, `TYPE`,
+`CODE`, `AMOUNT`, `DESCRIPTION` e `ATTRIBUTE*` continuam contextuais e não são
+canonicalizados globalmente.
+
+## Vetorização semântica retomável
+
+Depois de concluir `normalize-index`, vetorize somente os textos normalizados
+únicos com `vectorize-index`. O modelo base é o padrão e pode ser informado
+explicitamente:
+
+```powershell
+& ".\.venv\Scripts\python.exe" -u build_knowledge_base.py vectorize-index `
+  --graph-dir ".\data\graph\fusion_modules" `
+  --semantic-model "intfloat/multilingual-e5-base" `
+  --semantic-device "cpu" `
+  --semantic-batch-size 32 `
+  --checkpoint-percent 1
+```
+
+O perfil base usa 768 dimensões e aplica automaticamente os prefixos corretos:
+
+```text
+consulta:  query: <pergunta>
+documento: passage: <texto normalizado>
+```
+
+Para usar o modelo maior:
+
+```powershell
+& ".\.venv\Scripts\python.exe" -u build_knowledge_base.py vectorize-index `
+  --graph-dir ".\data\graph\fusion_modules" `
+  --semantic-model "intfloat/multilingual-e5-large-instruct" `
+  --semantic-device "cuda" `
+  --semantic-batch-size 32 `
+  --checkpoint-percent 1
+```
+
+O perfil `large-instruct` usa 1.024 dimensões e o formato de instrução próprio
+do modelo. Para esse perfil, GPU NVIDIA com CUDA é recomendada. Em CPU, um
+corpus grande pode exigir dezenas de horas. TPU não é suportada pela
+implementação atual.
+
+A dimensão esperada é inferida automaticamente pelo modelo selecionado. A opção
+`--expected-dimensions` permanece disponível apenas para validação ou
+diagnóstico explícito.
+
+A etapa lê `semantic_normalization.sqlite` e grava:
+
+```text
+data/graph/fusion_modules/search_index/
+├── semantic_embeddings.sqlite
+└── semantic_embeddings_manifest.json
+```
+
+Os vetores são normalizados em L2 e persistidos como `float32`. A identidade do
+cache combina o hash do texto normalizado, o modelo e a versão do perfil. Os
+embeddings de modelos diferentes permanecem separados no mesmo banco e nunca
+são misturados ou reutilizados entre si. Ao trocar de modelo, toda a
+normalização é reaproveitada, mas os vetores precisam ser produzidos para o
+novo espaço vetorial.
+
+A vetorização é:
+
+- idempotente: uma execução concluída com a mesma normalização e o mesmo perfil
+  não chama novamente o modelo;
+- incremental: textos cujo hash já possui embedding compatível são reutilizados;
+- retomável: cada lote é confirmado no SQLite e uma nova execução continua dos
+  textos ainda sem vetor;
+- observável: o log apresenta percentual, contagens, dimensão e ETA aproximada.
+
+O mesmo modelo deve ser usado em `vectorize-index`, `build-index` e
+`search-federated`. Exemplo de busca com o perfil base:
+
+```powershell
+& ".\.venv\Scripts\python.exe" -u build_knowledge_base.py search-federated `
+  --graph-dir ".\data\graph\fusion_modules" `
+  --query "acordos de compra e fornecedor" `
+  --semantic-model "intfloat/multilingual-e5-base" `
+  --semantic-device "cpu"
+```
+
+O roteamento ADF-first continua independente do modelo escolhido: o ADF reduz
+o universo de recursos e entidades candidatos antes da expansão local, mas a
+consulta e os documentos comparados semanticamente precisam pertencer ao mesmo
+espaço vetorial.
+
+Exemplo de progresso:
+
+```text
+[VECTORIZE] 51821/259102 textos (20.00%) | gerados=51821 |
+reutilizados=0 | dimensões=768 | ETA 03:42:10 | checkpoint persistido.
+```
+
+Após `Ctrl+C`, repita o mesmo comando. Para iniciar outro run preservando o
+cache compatível, use `--no-resume`. Para descartar e recalcular os vetores do
+perfil atual, use `--force-revectorize`.

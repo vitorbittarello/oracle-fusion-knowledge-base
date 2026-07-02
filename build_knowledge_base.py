@@ -34,12 +34,25 @@ from oracle_knowledge.indexing import (
     build_search_index,
     resolve_index_source,
 )
+from oracle_knowledge.semantic_normalization import (
+    DEFAULT_CHECKPOINT_PERCENT,
+    DEFAULT_NORMALIZATION_BATCH_SIZE,
+    normalize_semantic_corpus,
+)
+from oracle_knowledge.semantic_vectorization import (
+    DEFAULT_EMBEDDING_BATCH_SIZE,
+    DEFAULT_EMBEDDING_CHECKPOINT_PERCENT,
+    DEFAULT_EXPECTED_DIMENSIONS,
+    vectorize_semantic_corpus,
+)
 from oracle_knowledge.search.hybrid_search import HybridSearch, SearchConfig
 from oracle_knowledge.search.federated_search import FederatedGraphSearch
 from oracle_knowledge.search.semantic_context import (
-    DEFAULT_EMBEDDING_MODEL,
-    SemanticContextConfig,
+    DEFAULT_LOCAL_EMBEDDING_MODEL,
+    SUPPORTED_EMBEDDING_MODELS,
     SemanticTextSelector,
+    resolve_embedding_model_profile,
+    semantic_context_config_for_model,
 )
 from oracle_knowledge.validation import (
     ValidationReport,
@@ -294,10 +307,170 @@ def build_parser() -> argparse.ArgumentParser:
         help="Interrompe a busca se o índice SQLite não estiver disponível.",
     )
     federated.add_argument(
+        "--semantic-model",
+        choices=SUPPORTED_EMBEDDING_MODELS,
+        default=DEFAULT_LOCAL_EMBEDDING_MODEL,
+        help=(
+            "Modelo usado na consulta semântica. Deve ser o mesmo usado na "
+            "vetorização e na construção do índice."
+        ),
+    )
+    federated.add_argument(
+        "--semantic-device",
+        help="Dispositivo do sentence-transformers, por exemplo cpu ou cuda.",
+    )
+    federated.add_argument(
+        "--semantic-batch-size",
+        type=int,
+        default=32,
+        help="Quantidade de textos codificados por lote na busca local.",
+    )
+
+    federated.add_argument(
         "--module",
         action="append",
         default=[],
         help="Restringe a busca a um module_id. Pode ser repetido.",
+    )
+
+    normalize_index = subparsers.add_parser(
+        "normalize-index",
+        help=(
+            "Prepara e deduplica de forma idempotente, incremental e retomável "
+            "as strings usadas pelos índices semânticos."
+        ),
+    )
+    normalize_index.add_argument("--graph-dir", required=True)
+    normalize_index.add_argument(
+        "--output",
+        help=(
+            "Arquivo SQLite do corpus normalizado. O padrão é "
+            "<graph-dir>/search_index/semantic_normalization.sqlite."
+        ),
+    )
+    normalize_index.add_argument(
+        "--layer",
+        action="append",
+        choices=[
+            "business",
+            "physical",
+            "otbi_analytics",
+            "otbi_security",
+            "rest",
+            "master",
+        ],
+        default=[],
+        help=(
+            "Normaliza somente a camada informada. Pode ser repetido. "
+            "Sem a opção, processa todas as camadas, começando por ADF/REST."
+        ),
+    )
+    normalize_index.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_NORMALIZATION_BATCH_SIZE,
+        help="Quantidade de nós confirmados em cada transação SQLite.",
+    )
+    normalize_index.add_argument(
+        "--checkpoint-percent",
+        type=float,
+        default=DEFAULT_CHECKPOINT_PERCENT,
+        help=(
+            "Percentual de avanço entre checkpoints formais e mensagens de "
+            "progresso. Os lotes são persistidos mesmo entre checkpoints."
+        ),
+    )
+    normalize_index.add_argument(
+        "--no-resume",
+        action="store_true",
+        help=(
+            "Inicia uma nova execução em vez de retomar um run interrompido. "
+            "O cache de textos normalizados continua sendo reutilizado."
+        ),
+    )
+    normalize_index.add_argument(
+        "--force-renormalize",
+        action="store_true",
+        help=(
+            "Reprocessa os nós mesmo quando o documento e as versões de "
+            "normalização e segmentação não mudaram."
+        ),
+    )
+
+    vectorize_index = subparsers.add_parser(
+        "vectorize-index",
+        help=(
+            "Vetoriza os textos únicos do corpus normalizado de forma "
+            "idempotente, incremental e retomável."
+        ),
+    )
+    vectorize_index.add_argument("--graph-dir", required=True)
+    vectorize_index.add_argument(
+        "--normalization-db",
+        help=(
+            "Banco SQLite gerado por normalize-index. O padrão é "
+            "<graph-dir>/search_index/semantic_normalization.sqlite."
+        ),
+    )
+    vectorize_index.add_argument(
+        "--output",
+        help=(
+            "Banco SQLite de embeddings. O padrão é "
+            "<graph-dir>/search_index/semantic_embeddings.sqlite."
+        ),
+    )
+    vectorize_index.add_argument(
+        "--semantic-model",
+        choices=SUPPORTED_EMBEDDING_MODELS,
+        default=DEFAULT_LOCAL_EMBEDDING_MODEL,
+        help=(
+            "Modelo sentence-transformers usado na vetorização. O padrão "
+            "local é multilingual-e5-base; o large-instruct é indicado para GPU."
+        ),
+    )
+    vectorize_index.add_argument(
+        "--semantic-device",
+        help="Dispositivo do sentence-transformers, por exemplo cpu ou cuda.",
+    )
+    vectorize_index.add_argument(
+        "--semantic-batch-size",
+        type=int,
+        default=DEFAULT_EMBEDDING_BATCH_SIZE,
+        help="Quantidade de textos únicos codificados por lote persistente.",
+    )
+    vectorize_index.add_argument(
+        "--checkpoint-percent",
+        type=float,
+        default=DEFAULT_EMBEDDING_CHECKPOINT_PERCENT,
+        help=(
+            "Percentual entre checkpoints e mensagens de progresso. Cada "
+            "lote é confirmado no SQLite mesmo entre checkpoints."
+        ),
+    )
+    vectorize_index.add_argument(
+        "--expected-dimensions",
+        type=int,
+        default=DEFAULT_EXPECTED_DIMENSIONS,
+        help=(
+            "Sobrescreve a dimensão esperada. Por padrão, a dimensão é "
+            "inferida do modelo selecionado: 768 no base e 1024 no large-instruct."
+        ),
+    )
+    vectorize_index.add_argument(
+        "--no-resume",
+        action="store_true",
+        help=(
+            "Inicia um novo run em vez de retomar uma execução interrompida. "
+            "Embeddings compatíveis já persistidos continuam reutilizáveis."
+        ),
+    )
+    vectorize_index.add_argument(
+        "--force-revectorize",
+        action="store_true",
+        help=(
+            "Descarta e recalcula os embeddings do perfil atual para a versão "
+            "normalizada selecionada."
+        ),
     )
 
     build_index = subparsers.add_parser(
@@ -360,8 +533,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     build_index.add_argument(
         "--semantic-model",
-        default=DEFAULT_EMBEDDING_MODEL,
-        help="Modelo sentence-transformers usado no índice semântico.",
+        choices=SUPPORTED_EMBEDDING_MODELS,
+        default=DEFAULT_LOCAL_EMBEDDING_MODEL,
+        help=(
+            "Modelo sentence-transformers usado no índice semântico. Deve ser "
+            "o mesmo usado por vectorize-index e search-federated."
+        ),
     )
     build_index.add_argument(
         "--semantic-device",
@@ -951,11 +1128,20 @@ def search_federated_graphs(args: argparse.Namespace) -> None:
             file=sys.stderr,
         )
 
+    semantic_selector = SemanticTextSelector(
+        semantic_context_config_for_model(
+            args.semantic_model,
+            device=args.semantic_device,
+            batch_size=args.semantic_batch_size,
+        )
+    )
+
     with FederatedGraphSearch(
         args.graph_dir,
         index_path=args.index,
         use_index=not args.no_index,
         require_index=args.require_index,
+        semantic_text_selector=semantic_selector,
         progress=lambda message: print(
             message,
             file=sys.stderr,
@@ -971,6 +1157,45 @@ def search_federated_graphs(args: argparse.Namespace) -> None:
     print(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
+def run_normalize_index(args: argparse.Namespace) -> None:
+    progress = lambda message: print(message, file=sys.stderr, flush=True)
+    result = normalize_semantic_corpus(
+        args.graph_dir,
+        output_path=args.output,
+        layers=args.layer or None,
+        batch_size=args.batch_size,
+        checkpoint_percent=args.checkpoint_percent,
+        resume=not args.no_resume,
+        force_renormalize=args.force_renormalize,
+        progress=progress,
+    )
+    print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+
+
+def run_vectorize_index(args: argparse.Namespace) -> None:
+    progress = lambda message: print(message, file=sys.stderr, flush=True)
+    profile = resolve_embedding_model_profile(args.semantic_model)
+    expected_dimensions = (
+        args.expected_dimensions
+        if args.expected_dimensions is not None
+        else profile.dimensions
+    )
+    result = vectorize_semantic_corpus(
+        args.graph_dir,
+        normalization_database_path=args.normalization_db,
+        output_path=args.output,
+        model_name=args.semantic_model,
+        device=args.semantic_device,
+        batch_size=args.semantic_batch_size,
+        checkpoint_percent=args.checkpoint_percent,
+        expected_dimensions=expected_dimensions,
+        resume=not args.no_resume,
+        force_revectorize=args.force_revectorize,
+        progress=progress,
+    )
+    print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
+
+
 def run_build_index(args: argparse.Namespace) -> None:
     if args.output and args.output_dir:
         raise SystemExit("--output e --output-dir não podem ser usados juntos.")
@@ -980,8 +1205,8 @@ def run_build_index(args: argparse.Namespace) -> None:
     semantic_selector = None
     if not args.skip_semantic_index:
         semantic_selector = SemanticTextSelector(
-            SemanticContextConfig(
-                model_name=args.semantic_model,
+            semantic_context_config_for_model(
+                args.semantic_model,
                 device=args.semantic_device,
                 batch_size=args.semantic_batch_size,
             )
@@ -1109,6 +1334,10 @@ def main() -> None:
         search_graph(args)
     elif args.command == "search-federated":
         search_federated_graphs(args)
+    elif args.command == "normalize-index":
+        run_normalize_index(args)
+    elif args.command == "vectorize-index":
+        run_vectorize_index(args)
     elif args.command == "build-index":
         run_build_index(args)
     elif args.command == "validate-index":

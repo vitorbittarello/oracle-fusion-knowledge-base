@@ -6,7 +6,79 @@ from typing import Any
 
 import numpy as np
 
-DEFAULT_EMBEDDING_MODEL = "intfloat/multilingual-e5-large-instruct"
+E5_BASE_MODEL = "intfloat/multilingual-e5-base"
+E5_LARGE_INSTRUCT_MODEL = "intfloat/multilingual-e5-large-instruct"
+
+# Mantido como padrão interno para compatibilidade com chamadas legadas que
+# constroem SemanticContextConfig diretamente. Os comandos de linha de comando
+# usam DEFAULT_LOCAL_EMBEDDING_MODEL, mais adequado para execução em CPU local.
+DEFAULT_EMBEDDING_MODEL = E5_LARGE_INSTRUCT_MODEL
+DEFAULT_LOCAL_EMBEDDING_MODEL = E5_BASE_MODEL
+
+
+@dataclass(frozen=True)
+class EmbeddingModelProfile:
+    name: str
+    model_name: str
+    dimensions: int
+    query_mode: str
+    query_prefix: str = ""
+    document_prefix: str = ""
+    task_instruction: str = ""
+
+
+EMBEDDING_MODEL_PROFILES: dict[str, EmbeddingModelProfile] = {
+    E5_BASE_MODEL: EmbeddingModelProfile(
+        name="e5-base",
+        model_name=E5_BASE_MODEL,
+        dimensions=768,
+        query_mode="prefix",
+        query_prefix="query: ",
+        document_prefix="passage: ",
+    ),
+    E5_LARGE_INSTRUCT_MODEL: EmbeddingModelProfile(
+        name="e5-large-instruct",
+        model_name=E5_LARGE_INSTRUCT_MODEL,
+        dimensions=1024,
+        query_mode="instruction",
+        task_instruction=(
+            "Given an Oracle Fusion Cloud question, retrieve passages that are most "
+            "useful to identify business meaning, physical tables, columns, joins, "
+            "validated rules, OTBI subject areas, and REST resources."
+        ),
+    ),
+}
+SUPPORTED_EMBEDDING_MODELS = tuple(EMBEDDING_MODEL_PROFILES)
+
+
+def resolve_embedding_model_profile(model_name: str) -> EmbeddingModelProfile:
+    try:
+        return EMBEDDING_MODEL_PROFILES[model_name]
+    except KeyError as exc:
+        supported = ", ".join(SUPPORTED_EMBEDDING_MODELS)
+        raise ValueError(
+            f"Modelo semântico não suportado: {model_name}. "
+            f"Modelos disponíveis: {supported}."
+        ) from exc
+
+
+def semantic_context_config_for_model(
+    model_name: str,
+    *,
+    device: str | None = None,
+    batch_size: int = 16,
+) -> "SemanticContextConfig":
+    profile = resolve_embedding_model_profile(model_name)
+    return SemanticContextConfig(
+        model_name=profile.model_name,
+        task_instruction=profile.task_instruction,
+        device=device,
+        batch_size=batch_size,
+        query_mode=profile.query_mode,
+        query_prefix=profile.query_prefix,
+        document_prefix=profile.document_prefix,
+        expected_dimensions=profile.dimensions,
+    )
 
 
 @dataclass(frozen=True)
@@ -36,6 +108,10 @@ class SemanticContextConfig:
     candidate_preserve_top_results: int = 4
     candidate_group_score_ratio: float = 0.10
     candidate_top_segments: int = 2
+    query_mode: str = "instruction"
+    query_prefix: str = ""
+    document_prefix: str = ""
+    expected_dimensions: int | None = 1024
 
 
 @dataclass(frozen=True)
@@ -92,10 +168,23 @@ class SemanticTextSelector:
         return self._model
 
     def _format_query(self, query: str) -> str:
+        compact = query.strip()
+        if self.config.query_mode == "prefix":
+            return f"{self.config.query_prefix}{compact}"
+        if self.config.query_mode != "instruction":
+            raise ValueError(
+                f"query_mode semântico inválido: {self.config.query_mode}"
+            )
         return (
             f"Instruct: {self.config.task_instruction}\n"
-            f"Query: {query.strip()}"
+            f"Query: {compact}"
         )
+
+    def _format_documents(self, documents: list[str]) -> list[str]:
+        prefix = self.config.document_prefix
+        if not prefix:
+            return documents
+        return [f"{prefix}{document}" for document in documents]
 
     def encode_query(self, query: str) -> np.ndarray:
         """Codifica uma consulta em um vetor normalizado reutilizável."""
@@ -117,7 +206,7 @@ class SemanticTextSelector:
             return np.empty((0, 0), dtype=np.float32)
         model = self._load_model()
         values = model.encode(
-            documents,
+            self._format_documents(documents),
             batch_size=self.config.batch_size,
             show_progress_bar=False,
             convert_to_numpy=True,
