@@ -1,0 +1,5 @@
+# Toda alteração no repositório precisa da aprovação do proprietário.
+* @vitorbittarello
+
+# Protege explicitamente o próprio arquivo CODEOWNERS.
+/.github/CODEOWNERS @vitorbittarello
