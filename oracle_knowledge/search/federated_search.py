@@ -63,7 +63,11 @@ class FederatedGraphSearch:
         self._rest_operation_diagnostics: dict[str, Any] = {}
         self._semantic_inference_diagnostics: dict[str, dict[str, int]] = {}
 
-        resolved_index = resolve_index_source(self.graph_dir, index_path)
+        resolved_index = resolve_index_source(
+            self.graph_dir,
+            index_path,
+            model_name=self.semantic_text_selector.config.model_name,
+        )
         if use_index and resolved_index.is_file():
             if resolved_index.suffix.casefold() == ".json":
                 self.index_store = IndexedGraphBundleStore(

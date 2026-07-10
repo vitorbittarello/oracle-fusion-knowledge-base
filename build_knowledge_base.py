@@ -34,6 +34,7 @@ from oracle_knowledge.indexing import (
     build_search_index,
     resolve_index_source,
 )
+from oracle_knowledge.semantic_index_cache import resolve_semantic_embedding_cache
 from oracle_knowledge.semantic_normalization import (
     DEFAULT_CHECKPOINT_PERCENT,
     DEFAULT_NORMALIZATION_BATCH_SIZE,
@@ -532,6 +533,20 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     build_index.add_argument(
+        "--normalization-db",
+        help=(
+            "Banco SQLite gerado por normalize-index. O padrão é "
+            "<graph-dir>/search_index/semantic_normalization.sqlite."
+        ),
+    )
+    build_index.add_argument(
+        "--embedding-db",
+        help=(
+            "Banco SQLite gerado por vectorize-index. O padrão é "
+            "<graph-dir>/search_index/semantic_embeddings.sqlite."
+        ),
+    )
+    build_index.add_argument(
         "--semantic-model",
         choices=SUPPORTED_EMBEDDING_MODELS,
         default=DEFAULT_LOCAL_EMBEDDING_MODEL,
@@ -561,6 +576,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Manifesto index_bundle.json ou índice SQLite legado. "
             "O padrão prioriza o bundle separado por camada."
+        ),
+    )
+    validate_index.add_argument(
+        "--semantic-model",
+        choices=SUPPORTED_EMBEDDING_MODELS,
+        default=DEFAULT_LOCAL_EMBEDDING_MODEL,
+        help=(
+            "Perfil usado para localizar automaticamente o bundle correto."
         ),
     )
     validate_index.add_argument(
@@ -1120,7 +1143,11 @@ def search_federated_graphs(args: argparse.Namespace) -> None:
     if args.no_index and args.require_index:
         raise SystemExit("--no-index e --require-index não podem ser usados juntos.")
 
-    resolved_index = resolve_index_source(args.graph_dir, args.index)
+    resolved_index = resolve_index_source(
+        args.graph_dir,
+        args.index,
+        model_name=args.semantic_model,
+    )
     if not args.no_index and not resolved_index.is_file() and not args.require_index:
         print(
             "[AVISO] Bundle de índices ou índice SQLite não encontrado; "
@@ -1203,6 +1230,7 @@ def run_build_index(args: argparse.Namespace) -> None:
         raise SystemExit("--layer não pode ser usado com o índice monolítico --output.")
 
     semantic_selector = None
+    semantic_cache = None
     if not args.skip_semantic_index:
         semantic_selector = SemanticTextSelector(
             semantic_context_config_for_model(
@@ -1210,6 +1238,12 @@ def run_build_index(args: argparse.Namespace) -> None:
                 device=args.semantic_device,
                 batch_size=args.semantic_batch_size,
             )
+        )
+        semantic_cache = resolve_semantic_embedding_cache(
+            args.graph_dir,
+            model_name=args.semantic_model,
+            normalization_database_path=args.normalization_db,
+            embedding_database_path=args.embedding_db,
         )
 
     progress = lambda message: print(message, file=sys.stderr, flush=True)
@@ -1222,6 +1256,7 @@ def run_build_index(args: argparse.Namespace) -> None:
             semantic_text_selector=semantic_selector,
             semantic_batch_size=args.semantic_batch_size,
             progress=progress,
+            semantic_embedding_cache=semantic_cache,
         )
     else:
         result = build_index_bundle(
@@ -1235,6 +1270,7 @@ def run_build_index(args: argparse.Namespace) -> None:
             progress=progress,
             force=args.force,
             reuse_embeddings=not args.no_reuse_embeddings,
+            semantic_embedding_cache=semantic_cache,
         )
     print(json.dumps(result.to_dict(), indent=2, ensure_ascii=False))
 
@@ -1279,7 +1315,11 @@ def run_validate_adf(args: argparse.Namespace) -> None:
 
 
 def run_validate_index(args: argparse.Namespace) -> None:
-    index_path = resolve_index_source(args.graph_dir, args.index)
+    index_path = resolve_index_source(
+        args.graph_dir,
+        args.index,
+        model_name=args.semantic_model,
+    )
     if index_path.suffix.casefold() == ".json":
         report = validate_index_bundle(
             index_path,
