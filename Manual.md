@@ -6,6 +6,11 @@ Este manual explica como usar a ferramenta para localizar documentação relevan
 
 Os exemplos de execução são apresentados em **Bash** e **PowerShell**. No Bash, a continuação de linha usa `\`; no PowerShell, usa crase (`` ` ``).
 
+> [!IMPORTANT]
+> Esta é uma **ferramenta independente e não oficial**. Ela não é um produto Oracle, não possui suporte oficial da Oracle e não substitui o **Analista Funcional Oracle Fusion**, a validação técnica nem a homologação com dados reais. Seu objetivo é acelerar a descoberta de fontes e apoiar a construção de pipelines de extração de dados do Oracle Fusion Cloud Applications.
+>
+> Antes de executar qualquer comando, aplique a [configuração UTF-8 obrigatória](#configuração-utf-8-obrigatória). Consulte também o [artigo do autor no Medium sobre o projeto](https://medium.com/p/4d524bfea5fa).
+
 ---
 
 ## 1. Para que serve
@@ -38,6 +43,72 @@ A ferramenta:
 - não deve inventar joins, filtros ou significados de códigos.
 
 O resultado é um **contexto de apoio**, não uma homologação automática.
+
+A responsabilidade final permanece distribuída entre:
+
+- **Analista Funcional:** confirma significado, configuração, status, filtros e comportamento do processo;
+- **Engenharia de Dados:** valida fonte, join, grão, performance, incrementalidade e qualidade da extração;
+- **Governança e Segurança:** valida acesso, uso, retenção e exposição dos dados;
+- **Ferramenta:** organiza evidências, restringe a busca, registra lacunas e acelera o trabalho dessas equipes.
+
+---
+
+## Configuração UTF-8 obrigatória
+
+O projeto, os catálogos e os resultados JSON usam UTF-8. Configure o terminal antes de coletar, indexar ou pesquisar.
+
+### Bash
+
+```bash
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+```
+
+### PowerShell
+
+```powershell
+chcp 65001 > $null
+
+$utf8 = [System.Text.UTF8Encoding]::new($false)
+
+[Console]::InputEncoding  = $utf8
+[Console]::OutputEncoding = $utf8
+$OutputEncoding = $utf8
+
+$env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
+```
+
+No Windows, execute o Python com `-X utf8` nos comandos do projeto. PowerShell 7+ é recomendado. O PowerShell 5.1 é suportado desde que a sessão seja configurada como acima.
+
+> [!WARNING]
+> Apenas usar `Out-File -Encoding utf8` não é suficiente. O comando grava em UTF-8, mas o pipeline pode já ter interpretado incorretamente a saída do Python. O sintoma típico é `Aquisição` aparecer como `AquisiþÒo`.
+
+### Validar o ambiente
+
+#### Bash
+
+```bash
+python -X utf8 -c 'import json; print(json.dumps({"texto": "Aquisição, Descrição, Não, inferência"}, ensure_ascii=False))' \
+  > "./teste_utf8.json"
+cat "./teste_utf8.json"
+```
+
+#### PowerShell
+
+```powershell
+& ".\.venv\Scripts\python.exe" -X utf8 -c `
+  "import json; print(json.dumps({'texto': 'Aquisição, Descrição, Não, inferência'}, ensure_ascii=False))" |
+  Set-Content `
+    -Path ".\teste_utf8.json" `
+    -Encoding utf8
+
+Get-Content ".\teste_utf8.json" -Raw -Encoding utf8
+```
+
+O texto deve permanecer exatamente igual. Se o primeiro teste do Python for correto e o arquivo gerado pelo pipeline estiver corrompido, o problema está na sessão do PowerShell, não na base de conhecimento.
 
 ---
 
@@ -455,12 +526,110 @@ Nesse caso:
 
 ### Baixa confiança
 
-- semelhança textual isolada;
-- ausência de mapeamento;
-- conclusão não confirmada;
-- código de status sem lookup ou documentação.
+- similaridade semântica sem ponte explícita;
+- nome parecido;
+- inferência por descrição;
+- tabela ou coluna sem função validada;
+- hipótese de negócio ainda não confirmada.
 
-A resposta final deve diferenciar fatos documentados de inferências.
+### Estados de resolução
+
+| Estado | Interpretação | Ação |
+|---|---|---|
+| `resolved` | evidência forte e caminho compatível | revisar e validar com dados |
+| `partial` | há ID ou parte do caminho | completar join e descrição |
+| `ambiguous` | mais de um candidato ou apenas sugestão | curar ou validar funcionalmente |
+| `unresolved` | não há candidato seguro | coletar ou registrar conhecimento |
+
+### Regra de ouro
+
+```text
+mapeamento curado ou regra validada
+  > nome técnico exato
+  > evidência documental
+  > lexical forte
+  > similaridade semântica
+```
+
+A similaridade semântica serve para sugerir onde investigar. Ela não transforma uma coluna em verdade funcional.
+
+---
+
+## Como obter alta assertividade
+
+Uma busca de alta qualidade combina quatro dimensões:
+
+1. **escopo estrutural correto:** módulo, entidade e comunidade;
+2. **atributos curados:** aliases e colunas qualificadas;
+3. **caminhos completos:** joins, descrições e cardinalidades;
+4. **regras validadas:** filtros, status, vigência, ranking e grão.
+
+### O que deve ser curado
+
+- termos funcionais em português e inglês;
+- entidade canônica;
+- atributo canônico;
+- tabela e coluna qualificadas;
+- relacionamento até nomes descritivos;
+- regra de seleção;
+- grão;
+- fonte e confiança;
+- diferenças da implantação.
+
+### Conhecimento Oracle padrão
+
+É reutilizável entre ambientes quando sustentado por documentação oficial. Exemplos candidatos para Acordos de Compra:
+
+```text
+Acordo            → PO_HEADERS_ALL.SEGMENT1
+Moeda             → PO_HEADERS_ALL.CURRENCY_CODE
+Data Inicial      → PO_HEADERS_ALL.START_DATE
+Data Final        → PO_HEADERS_ALL.END_DATE
+Data da Criação   → PO_HEADERS_ALL.CREATION_DATE
+Valor Liberado    → PO_HEADERS_ALL.AMOUNT_RELEASED
+```
+
+Mesmo nesses casos, valide release, tipo de documento e definição funcional solicitada.
+
+### Conhecimento específico da implantação
+
+Precisa da participação do Analista Funcional e das equipes responsáveis:
+
+- DFF, EFF e atributos customizados;
+- configurações ADF;
+- significado local de códigos;
+- tipos de acordo efetivamente usados;
+- filtros de BU, status ou vigência;
+- origem oficial de valores;
+- views Gold e integrações;
+- sistema de autoridade;
+- regras de segurança.
+
+### Quando registrar curadoria e quando corrigir código
+
+Registre **curadoria** quando o motor não conhece um significado funcional, uma coluna, um alias, um join, uma regra ou uma característica da implantação.
+
+Abra uma correção de **código** quando:
+
+- evidência curada perde para candidato genérico;
+- um candidato desconectado atravessa o gating;
+- o grão não é considerado;
+- o mesmo input produz resultado não determinístico;
+- o JSON não explica a decisão;
+- o processamento não é incremental ou retomável;
+- há problema de performance, cache, encoding ou serialização.
+
+Compactação do JSON, redução de candidatos diagnósticos e tuning de thresholds são acabamento do motor. Eles não substituem a curadoria ausente.
+
+### Evidência parcial
+
+Exemplo:
+
+```text
+Fornecedor → PO_HEADERS_ALL.VENDOR_ID
+```
+
+Isso comprova o identificador, mas não entrega o nome. O resultado deve ser `partial` até existir caminho validado até a coluna descritiva.
 
 ---
 
@@ -598,6 +767,76 @@ python build_knowledge_base.py link \
 
 ## 16. Registrar aliases e mapeamentos
 
+A curadoria deve ser registrada em arquivos versionados. Evite criar regras específicas no código para responder um único caso.
+
+### Exemplo de atributo curado
+
+No arquivo:
+
+```text
+data/modules/<module_id>/config/entity_aliases.json
+```
+
+registre o atributo dentro da entidade:
+
+```json
+{
+  "entity_id": "purchase_agreement",
+  "name": "Purchase Agreement",
+  "aliases": [
+    "acordo de compra",
+    "gerenciar acordo"
+  ],
+  "tables": [
+    "PO_HEADERS_ALL"
+  ],
+  "attributes": [
+    {
+      "attribute_id": "agreement_number",
+      "name": "Agreement Number",
+      "aliases": [
+        "acordo",
+        "número do acordo",
+        "agreement number"
+      ],
+      "description": "Número do documento do acordo de compra.",
+      "columns": [
+        "PO_HEADERS_ALL.SEGMENT1"
+      ],
+      "confidence": "high"
+    }
+  ],
+  "module_id": "procurement"
+}
+```
+
+O linker criará o atributo e o mapeamento para a coluna quando a coluna existir no grafo físico.
+
+### Informações que devem acompanhar a curadoria
+
+- origem da evidência;
+- release Oracle;
+- módulo;
+- ambiente validado;
+- pessoa ou equipe que validou;
+- data da validação;
+- confiança;
+- grão;
+- observações sobre configuração local.
+
+### Evitar aliases excessivamente genéricos
+
+Termos como `valor`, `data`, `status` e `descrição` podem existir em centenas de colunas. Prefira aliases contextualizados:
+
+```text
+valor do acordo
+status do acordo
+data inicial da vigência
+data de criação do acordo
+```
+
+O alias genérico pode permanecer como termo de entrada, mas a promoção da coluna deve depender de entidade, mapeamento ou regra validada.
+
 Aliases ligam a linguagem do usuário aos objetos técnicos.
 
 Exemplos:
@@ -644,6 +883,91 @@ Relação validada: integrates_with
 O owner real deve ser abstraído por um papel lógico. Assim, a mesma curadoria pode ser usada em desenvolvimento, homologação e produção sem transformar o nome do schema em parte do significado do objeto.
 
 Nesta versão, essas informações são registradas por curadoria. A leitura automática de DDLs Gold e configurações de integração ainda não faz parte dos comandos disponíveis.
+
+### Publicar e validar a curadoria
+
+#### Bash
+
+```bash
+python -X utf8 build_knowledge_base.py link \
+  --modules-root "./data/modules" \
+  --include-default-curation \
+  --output-dir "./data/graph/fusion_modules"
+
+python -X utf8 build_knowledge_base.py build-topology \
+  --graph-dir "./data/graph/fusion_modules"
+
+python -X utf8 build_knowledge_base.py normalize-index \
+  --graph-dir "./data/graph/fusion_modules" \
+  --batch-size 1000 \
+  --checkpoint-percent 1
+
+python -X utf8 build_knowledge_base.py vectorize-index \
+  --graph-dir "./data/graph/fusion_modules" \
+  --semantic-model "intfloat/multilingual-e5-base" \
+  --semantic-device cpu \
+  --semantic-batch-size 32 \
+  --checkpoint-percent 1
+
+python -X utf8 build_knowledge_base.py build-index \
+  --graph-dir "./data/graph/fusion_modules" \
+  --layer business \
+  --layer master \
+  --semantic-model "intfloat/multilingual-e5-base"
+
+python -X utf8 build_knowledge_base.py validate-index \
+  --graph-dir "./data/graph/fusion_modules"
+```
+
+#### PowerShell
+
+```powershell
+& ".\.venv\Scripts\python.exe" -X utf8 build_knowledge_base.py link `
+  --modules-root ".\data\modules" `
+  --include-default-curation `
+  --output-dir ".\data\graph\fusion_modules"
+
+& ".\.venv\Scripts\python.exe" -X utf8 build_knowledge_base.py build-topology `
+  --graph-dir ".\data\graph\fusion_modules"
+
+& ".\.venv\Scripts\python.exe" -X utf8 build_knowledge_base.py normalize-index `
+  --graph-dir ".\data\graph\fusion_modules" `
+  --batch-size 1000 `
+  --checkpoint-percent 1
+
+& ".\.venv\Scripts\python.exe" -X utf8 build_knowledge_base.py vectorize-index `
+  --graph-dir ".\data\graph\fusion_modules" `
+  --semantic-model "intfloat/multilingual-e5-base" `
+  --semantic-device "cpu" `
+  --semantic-batch-size 32 `
+  --checkpoint-percent 1
+
+& ".\.venv\Scripts\python.exe" -X utf8 build_knowledge_base.py build-index `
+  --graph-dir ".\data\graph\fusion_modules" `
+  --layer business `
+  --layer master `
+  --semantic-model "intfloat/multilingual-e5-base"
+
+& ".\.venv\Scripts\python.exe" -X utf8 build_knowledge_base.py validate-index `
+  --graph-dir ".\data\graph\fusion_modules"
+```
+
+A normalização e a vetorização são incrementais. Execute-as quando a curadoria criar ou alterar textos, aliases e atributos. Alterações apenas no algoritmo, ranking ou formato do JSON não exigem reprocessamento do corpus.
+
+### Checklist de revisão funcional
+
+Antes de aprovar uma curadoria:
+
+- o atributo representa exatamente o campo solicitado;
+- a coluna existe na release coletada;
+- a descrição oficial sustenta o significado;
+- o grão da tabela é compatível;
+- joins não multiplicam linhas indevidamente;
+- IDs possuem caminho até descrições quando necessário;
+- filtros e códigos foram validados;
+- a origem foi registrada;
+- existe teste de regressão;
+- nenhum candidato proibido foi promovido.
 
 ---
 
@@ -944,18 +1268,36 @@ ou:
 
 ### Caracteres corrompidos
 
-Configure UTF-8 e salve com:
+Volte à seção [Configuração UTF-8 obrigatória](#configuração-utf-8-obrigatória). Não tente reparar o texto no Query Planner antes de validar a fronteira entre Python e o terminal.
 
 #### Bash
 
 ```bash
-> arquivo.json
+python -X utf8 build_knowledge_base.py search-federated \
+  --graph-dir "./data/graph/fusion_modules" \
+  --query "Aquisição, Descrição, Condições de Pagamento" \
+  > "./resultado_utf8.json"
 ```
 
 #### PowerShell
 
 ```powershell
-Out-File -Encoding utf8
+& ".\.venv\Scripts\python.exe" -X utf8 build_knowledge_base.py search-federated `
+  --graph-dir ".\data\graph\fusion_modules" `
+  --query "Aquisição, Descrição, Condições de Pagamento" |
+  Set-Content `
+    -Path ".\resultado_utf8.json" `
+    -Encoding utf8
+```
+
+Confirme no JSON:
+
+```json
+{
+  "encoding_status": "valid",
+  "corrections": [],
+  "ambiguous_markers": []
+}
 ```
 
 ### Fonte ausente
@@ -1162,10 +1504,21 @@ CUDA acelera a inferência do modelo semântico. A gravação SQLite, o FTS5, os
 
 ## Preparar o corpus semântico antes dos índices
 
-A etapa de normalização é executada separadamente da vetorização:
+A etapa de normalização é executada separadamente da vetorização.
+
+### Bash
+
+```bash
+python -X utf8 -u build_knowledge_base.py normalize-index \
+  --graph-dir "./data/graph/fusion_modules" \
+  --batch-size 1000 \
+  --checkpoint-percent 1
+```
+
+### PowerShell
 
 ```powershell
-& ".\.venv\Scripts\python.exe" -u build_knowledge_base.py normalize-index `
+& ".\.venv\Scripts\python.exe" -X utf8 -u build_knowledge_base.py normalize-index `
   --graph-dir ".\data\graph\fusion_modules" `
   --batch-size 1000 `
   --checkpoint-percent 1
@@ -1194,11 +1547,25 @@ semânticos passará a consumir esse corpus em etapa posterior.
 
 ## Vetorizar o corpus normalizado
 
-Após a normalização, execute:
+Após a normalização, execute.
+
+### Bash
+
+```bash
+python -X utf8 -u build_knowledge_base.py vectorize-index \
+  --graph-dir "./data/graph/fusion_modules" \
+  --semantic-model "intfloat/multilingual-e5-base" \
+  --semantic-device cpu \
+  --semantic-batch-size 32 \
+  --checkpoint-percent 1
+```
+
+### PowerShell
 
 ```powershell
-& ".\.venv\Scripts\python.exe" -u build_knowledge_base.py vectorize-index `
+& ".\.venv\Scripts\python.exe" -X utf8 -u build_knowledge_base.py vectorize-index `
   --graph-dir ".\data\graph\fusion_modules" `
+  --semantic-model "intfloat/multilingual-e5-base" `
   --semantic-device "cpu" `
   --semantic-batch-size 32 `
   --checkpoint-percent 1
@@ -1208,10 +1575,7 @@ O comando consome `search_index/semantic_normalization.sqlite` e grava os
 vetores em `search_index/semantic_embeddings.sqlite`, com manifesto em
 `search_index/semantic_embeddings_manifest.json`.
 
-O perfil padrão usa `intfloat/multilingual-e5-large-instruct`, 1.024 dimensões,
-normalização L2 e persistência `float32`. Cada lote é confirmado no SQLite. Em
-caso de interrupção, execute o mesmo comando novamente para continuar dos
-textos ainda sem embedding.
+O perfil recomendado para uso local é `intfloat/multilingual-e5-base`, com 768 dimensões, normalização L2 e persistência `float32`. O perfil `intfloat/multilingual-e5-large-instruct`, com 1.024 dimensões, pode ser usado quando houver capacidade computacional compatível. Cada lote é confirmado no SQLite. Em caso de interrupção, execute o mesmo comando novamente para continuar dos textos ainda sem embedding.
 
 Exemplo de log:
 
@@ -1219,3 +1583,26 @@ Exemplo de log:
 [VECTORIZE] 51821/259102 textos (20.00%) | gerados=51821 |
 reutilizados=0 | dimensões=1024 | ETA 07:42:10 | checkpoint persistido.
 ```
+
+## Critérios finais antes de usar o contexto em um pipeline
+
+Não avance diretamente do JSON para produção. Confirme:
+
+- entidade, módulo e comunidade corretos;
+- atributos `resolved` sustentados por evidência forte;
+- atributos `partial` completados com joins descritivos;
+- atributos `ambiguous` e `unresolved` revisados;
+- grão do resultado;
+- cardinalidade dos joins;
+- significado dos status e códigos;
+- filtros de configuração da implantação;
+- segurança e autorização;
+- execução da SQL candidata com amostra real;
+- homologação funcional;
+- registro da curadoria aprendida.
+
+A ferramenta é um acelerador de engenharia e análise. Ela não substitui o processo de validação necessário para uma extração confiável do Oracle Fusion Cloud Applications.
+
+## Referência externa
+
+- [Artigo do autor no Medium sobre o Oracle Fusion Knowledge Base](https://medium.com/p/4d524bfea5fa)

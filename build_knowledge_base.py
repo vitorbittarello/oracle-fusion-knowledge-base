@@ -55,6 +55,7 @@ from oracle_knowledge.search.semantic_context import (
     resolve_embedding_model_profile,
     semantic_context_config_for_model,
 )
+from oracle_knowledge.topology import build_topology_catalog
 from oracle_knowledge.validation import (
     ValidationReport,
     render_validation_report,
@@ -333,6 +334,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help="Restringe a busca a um module_id. Pode ser repetido.",
     )
+
+    build_topology = subparsers.add_parser(
+        "build-topology",
+        help="Constrói comunidades estruturais, memberships e god nodes persistidos.",
+    )
+    build_topology.add_argument("--graph-dir", required=True)
+    build_topology.add_argument("--output")
+    build_topology.add_argument("--force", action="store_true")
 
     normalize_index = subparsers.add_parser(
         "normalize-index",
@@ -1184,6 +1193,16 @@ def search_federated_graphs(args: argparse.Namespace) -> None:
     print(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
+def run_build_topology(args: argparse.Namespace) -> None:
+    result = build_topology_catalog(
+        args.graph_dir,
+        output=args.output,
+        force=args.force,
+        progress=lambda message: print(message, file=sys.stderr, flush=True),
+    )
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
 def run_normalize_index(args: argparse.Namespace) -> None:
     progress = lambda message: print(message, file=sys.stderr, flush=True)
     result = normalize_semantic_corpus(
@@ -1374,6 +1393,8 @@ def main() -> None:
         search_graph(args)
     elif args.command == "search-federated":
         search_federated_graphs(args)
+    elif args.command == "build-topology":
+        run_build_topology(args)
     elif args.command == "normalize-index":
         run_normalize_index(args)
     elif args.command == "vectorize-index":
