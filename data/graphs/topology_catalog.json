@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.0.0",
+  "algorithm_version": "topology-1.0.0",
+  "graph_signature": "a461bf77bc4e4d732f7afc121c70e7f70ed8bf225a082a4e01951d1eb6b5c278",
+  "generated_at": "2026-07-10T17:53:53+00:00",
+  "community_count": 0,
+  "communities": [],
+  "memberships": {},
+  "edge_count": 0,
+  "structural_edge_count": 0,
+  "status": "rebuilt"
+}
