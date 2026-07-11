@@ -1137,21 +1137,30 @@ def validate_index_database(
             )
 
         if schema_version == INDEX_SCHEMA_VERSION:
-            if "semantic_segments" not in tables:
+            required_semantic_tables = {
+                "semantic_segments",
+                "semantic_root_refs",
+                "semantic_segment_refs",
+            }
+            missing_semantic_tables = sorted(
+                required_semantic_tables.difference(tables)
+            )
+            if missing_semantic_tables:
                 report.error(
                     "INDEX_SEMANTIC_SEGMENT_TABLE",
-                    "O índice atual não contém a tabela semantic_segments.",
+                    "O índice atual não contém todas as estruturas semânticas.",
                     path=path,
+                    details={"missing": missing_semantic_tables},
                 )
             else:
                 report.ok(
                     "INDEX_SEMANTIC_SEGMENT_TABLE",
-                    "A tabela de segmentos semânticos foi encontrada.",
+                    "As tabelas semânticas e de referências foram encontradas.",
                     path=path,
                 )
 
         user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
-        accepted_user_versions = {2, 3, INDEX_USER_VERSION}
+        accepted_user_versions = {2, 3, 4, INDEX_USER_VERSION}
         if user_version not in accepted_user_versions:
             report.error(
                 "INDEX_USER_VERSION",
@@ -1179,6 +1188,8 @@ def validate_index_database(
         required_sql_indexes = set(REQUIRED_SQL_INDEXES)
         if schema_version != INDEX_SCHEMA_VERSION:
             required_sql_indexes.discard("idx_semantic_segments_model")
+            required_sql_indexes.discard("idx_semantic_root_refs_hash")
+            required_sql_indexes.discard("idx_semantic_segment_refs_hash")
         missing_indexes = sorted(required_sql_indexes - sql_indexes)
         if missing_indexes:
             report.error(
@@ -1195,17 +1206,29 @@ def validate_index_database(
                 details={"count": len(required_sql_indexes)},
             )
 
+        semantic_cache_metadata = metadata.get("semantic_embedding_cache")
+        uses_semantic_refs = (
+            isinstance(semantic_cache_metadata, dict)
+            and "semantic_root_refs" in tables
+            and "semantic_segment_refs" in tables
+        )
+        root_table = "semantic_root_refs" if uses_semantic_refs else "semantic_roots"
+        segment_table = (
+            "semantic_segment_refs" if uses_semantic_refs else "semantic_segments"
+        )
         counts = {
             "nodes": int(connection.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]),
             "edges": int(connection.execute("SELECT COUNT(*) FROM edges").fetchone()[0]),
             "node_modules": int(connection.execute("SELECT COUNT(*) FROM node_modules").fetchone()[0]),
             "nodes_fts": int(connection.execute("SELECT COUNT(*) FROM nodes_fts").fetchone()[0]),
-            "semantic_roots": int(connection.execute("SELECT COUNT(*) FROM semantic_roots").fetchone()[0]),
+            "semantic_roots": int(
+                connection.execute(f"SELECT COUNT(*) FROM {root_table}").fetchone()[0]
+            ),
         }
-        if "semantic_segments" in tables:
+        if segment_table in tables:
             counts["semantic_segments"] = int(
                 connection.execute(
-                    "SELECT COUNT(*) FROM semantic_segments"
+                    f"SELECT COUNT(*) FROM {segment_table}"
                 ).fetchone()[0]
             )
         declared_counts = {
@@ -1284,10 +1307,10 @@ def validate_index_database(
                 details={"eligible": eligible_semantic_roots, "indexed": counts["semantic_roots"]},
             )
 
-        if "semantic_segments" in tables:
+        if segment_table in tables:
             semantic_segment_node_count = int(
                 connection.execute(
-                    "SELECT COUNT(DISTINCT node_pk) FROM semantic_segments"
+                    f"SELECT COUNT(DISTINCT node_pk) FROM {segment_table}"
                 ).fetchone()[0]
             )
             eligible_segment_nodes = _eligible_semantic_segment_node_count(
@@ -1344,56 +1367,175 @@ def validate_index_database(
                     },
                 )
 
-        invalid_semantic_vectors = int(
-            connection.execute(
-                """
-                SELECT COUNT(*)
-                  FROM semantic_roots
-                 WHERE dimensions <= 0
-                    OR length(embedding) != dimensions * 4
-                """
-            ).fetchone()[0]
-        )
-        if invalid_semantic_vectors:
-            report.error(
-                "INDEX_SEMANTIC_VECTOR_SHAPE",
-                "Existem embeddings com dimensão ou tamanho inválido.",
-                path=path,
-                details={"count": invalid_semantic_vectors},
+        if uses_semantic_refs:
+            cache = dict(semantic_cache_metadata)
+            raw_embedding_path = Path(
+                str(cache.get("embedding_database_path") or "")
             )
-        else:
-            report.ok(
-                "INDEX_SEMANTIC_VECTOR_SHAPE",
-                "Os embeddings persistidos possuem tamanho consistente.",
-                path=path,
-                details={"count": counts["semantic_roots"]},
+            embedding_candidates = (
+                [raw_embedding_path] if raw_embedding_path.is_absolute() else []
             )
+            if graph_root is not None:
+                embedding_candidates.append(
+                    graph_root / "search_index" / "semantic_embeddings.sqlite"
+                )
+            embedding_path = next(
+                (
+                    candidate.resolve()
+                    for candidate in embedding_candidates
+                    if candidate.is_file()
+                ),
+                None,
+            )
+            if embedding_path is None:
+                report.error(
+                    "INDEX_SEMANTIC_CACHE_MISSING",
+                    "O banco semantic_embeddings.sqlite referenciado não foi encontrado.",
+                    path=path,
+                )
+            else:
+                alias = "validation_embedding_cache"
+                connection.execute(
+                    f"ATTACH DATABASE ? AS {alias}",
+                    (f"file:{embedding_path.as_posix()}?mode=ro",),
+                )
+                try:
+                    cache_parameters = (
+                        str(cache.get("model_name") or ""),
+                        str(cache.get("embedding_profile_version") or ""),
+                        int(cache.get("dimensions") or 0),
+                    )
+                    missing_root_vectors = int(
+                        connection.execute(
+                            f"""
+                            SELECT COUNT(*)
+                              FROM semantic_root_refs r
+                              LEFT JOIN {alias}.semantic_embeddings e
+                                ON e.normalization_version = r.normalization_version
+                               AND e.normalized_text_hash = r.normalized_text_hash
+                               AND e.model_name = ?
+                               AND e.embedding_profile_version = ?
+                               AND e.dimensions = ?
+                             WHERE e.normalized_text_hash IS NULL
+                            """,
+                            cache_parameters,
+                        ).fetchone()[0]
+                    )
+                    missing_segment_vectors = int(
+                        connection.execute(
+                            f"""
+                            SELECT COUNT(*)
+                              FROM semantic_segment_refs r
+                              LEFT JOIN {alias}.semantic_embeddings e
+                                ON e.normalization_version = r.normalization_version
+                               AND e.normalized_text_hash = r.normalized_text_hash
+                               AND e.model_name = ?
+                               AND e.embedding_profile_version = ?
+                               AND e.dimensions = ?
+                             WHERE e.normalized_text_hash IS NULL
+                            """,
+                            cache_parameters,
+                        ).fetchone()[0]
+                    )
+                    invalid_cached_vectors = int(
+                        connection.execute(
+                            f"""
+                            SELECT COUNT(*)
+                              FROM {alias}.semantic_embeddings e
+                             WHERE e.model_name = ?
+                               AND e.embedding_profile_version = ?
+                               AND e.dimensions = ?
+                               AND (
+                                    e.dimensions <= 0
+                                    OR length(e.embedding) != e.dimensions * 4
+                               )
+                            """,
+                            cache_parameters,
+                        ).fetchone()[0]
+                    )
+                finally:
+                    connection.execute(f"DETACH DATABASE {alias}")
 
-        if "semantic_segments" in tables:
-            invalid_segment_vectors = int(
+                missing_vectors = missing_root_vectors + missing_segment_vectors
+                if missing_vectors or invalid_cached_vectors:
+                    report.error(
+                        "INDEX_SEMANTIC_VECTOR_SHAPE",
+                        "As referências semânticas não possuem vetores compatíveis.",
+                        path=path,
+                        details={
+                            "missing_roots": missing_root_vectors,
+                            "missing_segments": missing_segment_vectors,
+                            "invalid_cached_vectors": invalid_cached_vectors,
+                        },
+                    )
+                else:
+                    report.ok(
+                        "INDEX_SEMANTIC_VECTOR_SHAPE",
+                        "As referências apontam para vetores float32 compatíveis.",
+                        path=path,
+                        details={
+                            "roots": counts["semantic_roots"],
+                            "segments": counts.get("semantic_segments", 0),
+                            "embedding_database_path": str(embedding_path),
+                        },
+                    )
+                report.ok(
+                    "INDEX_SEMANTIC_SEGMENT_VECTOR_SHAPE",
+                    "Os segmentos referenciam o cache sem duplicar os BLOBs.",
+                    path=path,
+                    details={"count": counts.get("semantic_segments", 0)},
+                )
+        else:
+            invalid_semantic_vectors = int(
                 connection.execute(
                     """
                     SELECT COUNT(*)
-                      FROM semantic_segments
+                      FROM semantic_roots
                      WHERE dimensions <= 0
                         OR length(embedding) != dimensions * 4
                     """
                 ).fetchone()[0]
             )
-            if invalid_segment_vectors:
+            if invalid_semantic_vectors:
                 report.error(
-                    "INDEX_SEMANTIC_SEGMENT_VECTOR_SHAPE",
-                    "Existem segmentos semânticos com dimensão ou tamanho inválido.",
+                    "INDEX_SEMANTIC_VECTOR_SHAPE",
+                    "Existem embeddings com dimensão ou tamanho inválido.",
                     path=path,
-                    details={"count": invalid_segment_vectors},
+                    details={"count": invalid_semantic_vectors},
                 )
             else:
                 report.ok(
-                    "INDEX_SEMANTIC_SEGMENT_VECTOR_SHAPE",
-                    "Os segmentos semânticos persistidos possuem tamanho consistente.",
+                    "INDEX_SEMANTIC_VECTOR_SHAPE",
+                    "Os embeddings persistidos possuem tamanho consistente.",
                     path=path,
-                    details={"count": counts.get("semantic_segments", 0)},
+                    details={"count": counts["semantic_roots"]},
                 )
+
+            if "semantic_segments" in tables:
+                invalid_segment_vectors = int(
+                    connection.execute(
+                        """
+                        SELECT COUNT(*)
+                          FROM semantic_segments
+                         WHERE dimensions <= 0
+                            OR length(embedding) != dimensions * 4
+                        """
+                    ).fetchone()[0]
+                )
+                if invalid_segment_vectors:
+                    report.error(
+                        "INDEX_SEMANTIC_SEGMENT_VECTOR_SHAPE",
+                        "Existem segmentos semânticos com dimensão ou tamanho inválido.",
+                        path=path,
+                        details={"count": invalid_segment_vectors},
+                    )
+                else:
+                    report.ok(
+                        "INDEX_SEMANTIC_SEGMENT_VECTOR_SHAPE",
+                        "Os segmentos semânticos persistidos possuem tamanho consistente.",
+                        path=path,
+                        details={"count": counts.get("semantic_segments", 0)},
+                    )
 
         try:
             connection.execute(

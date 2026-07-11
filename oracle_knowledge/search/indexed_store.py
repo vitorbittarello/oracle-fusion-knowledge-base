@@ -59,9 +59,15 @@ class IndexedGraphStore:
                 "SELECT name FROM sqlite_master WHERE type = 'table'"
             )
         }
+        self._embedding_connection: sqlite3.Connection | None = None
+        self._embedding_cache_metadata: dict[str, Any] = {}
         self._validate_compatibility()
+        self._open_embedding_cache()
 
     def close(self) -> None:
+        if self._embedding_connection is not None:
+            self._embedding_connection.close()
+            self._embedding_connection = None
         self.connection.close()
 
     def __enter__(self) -> "IndexedGraphStore":
@@ -77,6 +83,17 @@ class IndexedGraphStore:
                 "Índice SQLite incompatível com a versão atual. "
                 f"Versões aceitas {sorted(SUPPORTED_INDEX_SCHEMA_VERSIONS)}, "
                 f"encontrado {schema_version}. Execute build-index novamente."
+            )
+
+        indexed_model = str(self.metadata.get("semantic_model_name") or "")
+        selected_model = str(
+            self.semantic_text_selector.config.model_name or ""
+        )
+        if indexed_model and selected_model and indexed_model != selected_model:
+            raise ValueError(
+                "O índice semântico foi construído com outro modelo: "
+                f"índice={indexed_model}, pesquisa={selected_model}. "
+                "Selecione o bundle correspondente ao modelo informado."
             )
 
         graph_files = self.connection.execute(
@@ -109,15 +126,114 @@ class IndexedGraphStore:
                         "Execute build-index novamente."
                     )
 
+    def _open_embedding_cache(self) -> None:
+        raw_cache = self.metadata.get("semantic_embedding_cache")
+        if not isinstance(raw_cache, dict):
+            return
+
+        cache = dict(raw_cache)
+        raw_path = Path(str(cache.get("embedding_database_path") or ""))
+        candidates = [raw_path] if raw_path.is_absolute() else []
+        candidates.append(
+            self.graph_dir / "search_index" / "semantic_embeddings.sqlite"
+        )
+        embedding_path = next(
+            (candidate.resolve() for candidate in candidates if candidate.is_file()),
+            None,
+        )
+        if embedding_path is None:
+            raise FileNotFoundError(
+                "O índice referencia semantic_embeddings.sqlite, mas o arquivo "
+                "não foi encontrado. Execute ou restaure vectorize-index antes "
+                "da pesquisa."
+            )
+
+        selected_model = str(
+            self.semantic_text_selector.config.model_name or ""
+        )
+        cached_model = str(cache.get("model_name") or "")
+        if cached_model and selected_model and cached_model != selected_model:
+            raise ValueError(
+                "O cache de embeddings do índice pertence a outro modelo: "
+                f"cache={cached_model}, pesquisa={selected_model}."
+            )
+
+        connection = sqlite3.connect(
+            f"file:{embedding_path.as_posix()}?mode=ro",
+            uri=True,
+        )
+        connection.row_factory = sqlite3.Row
+        self._embedding_connection = connection
+        self._embedding_cache_metadata = cache
+
+    @property
+    def has_semantic_root_refs(self) -> bool:
+        return (
+            "semantic_root_refs" in self._tables
+            and self._embedding_connection is not None
+        )
+
+    @property
+    def has_semantic_segment_refs(self) -> bool:
+        return (
+            "semantic_segment_refs" in self._tables
+            and self._embedding_connection is not None
+        )
+
+    def _cached_vectors(
+        self,
+        hashes: Iterable[str],
+    ) -> dict[str, np.ndarray]:
+        if self._embedding_connection is None:
+            return {}
+        identifiers = list(dict.fromkeys(str(value) for value in hashes if str(value)))
+        if not identifiers:
+            return {}
+
+        cache = self._embedding_cache_metadata
+        model_name = str(cache.get("model_name") or "")
+        profile_version = str(cache.get("embedding_profile_version") or "")
+        dimensions = int(cache.get("dimensions") or 0)
+        normalization_version = str(cache.get("normalization_version") or "")
+        vectors: dict[str, np.ndarray] = {}
+
+        for chunk in self._chunks(identifiers):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self._embedding_connection.execute(
+                f"""
+                SELECT normalized_text_hash, dimensions, embedding
+                  FROM semantic_embeddings
+                 WHERE normalization_version = ?
+                   AND model_name = ?
+                   AND embedding_profile_version = ?
+                   AND dimensions = ?
+                   AND normalized_text_hash IN ({placeholders})
+                """,
+                [
+                    normalization_version,
+                    model_name,
+                    profile_version,
+                    dimensions,
+                    *chunk,
+                ],
+            ).fetchall()
+            for row in rows:
+                row_dimensions = int(row["dimensions"])
+                vector = np.frombuffer(row["embedding"], dtype="<f4")
+                if vector.size == row_dimensions == dimensions:
+                    vectors[str(row["normalized_text_hash"])] = vector
+        return vectors
+
     @property
     def has_semantic_roots(self) -> bool:
-        return bool(self.metadata.get("semantic_root_count"))
+        return bool(self.metadata.get("semantic_root_count")) and (
+            self.has_semantic_root_refs or "semantic_roots" in self._tables
+        )
 
     @property
     def has_semantic_segments(self) -> bool:
-        return (
-            "semantic_segments" in self._tables
-            and bool(self.metadata.get("semantic_segment_count"))
+        return bool(self.metadata.get("semantic_segment_count")) and (
+            self.has_semantic_segment_refs or "semantic_segments" in self._tables
         )
 
     @staticmethod
@@ -201,6 +317,16 @@ class IndexedGraphStore:
 
         type_placeholders = ",".join("?" for _ in root_types)
         module_sql, module_params = self._module_clause(module_ids)
+        if self.has_semantic_root_refs:
+            return self._semantic_roots_from_refs(
+                query,
+                layer,
+                root_types=root_types,
+                module_sql=module_sql,
+                module_params=module_params,
+                limit=limit,
+                query_vector=query_vector,
+            )
         cursor = self.connection.execute(
             f"""
             SELECT n.node_pk, n.node_id, n.payload_json,
@@ -246,6 +372,52 @@ class IndexedGraphStore:
         ranked = sorted(best, key=lambda item: (-item[0], item[1]))
         return [(node, score) for score, _, node in ranked]
 
+    def _semantic_roots_from_refs(
+        self,
+        query: str,
+        layer: str,
+        *,
+        root_types: set[str],
+        module_sql: str,
+        module_params: list[str],
+        limit: int,
+        query_vector: np.ndarray | None,
+    ) -> list[tuple[dict[str, Any], float]]:
+        type_placeholders = ",".join("?" for _ in root_types)
+        rows = self.connection.execute(
+            f"""
+            SELECT n.node_id, n.payload_json, r.normalized_text_hash
+              FROM semantic_root_refs r
+              JOIN nodes n ON n.node_pk = r.node_pk
+             WHERE n.graph_layer = ?
+               AND n.node_type IN ({type_placeholders})
+               {module_sql}
+            """,
+            [layer, *sorted(root_types), *module_params],
+        ).fetchall()
+        if query_vector is None:
+            query_vector = self.semantic_text_selector.encode_query(query)
+        if query_vector.size == 0:
+            return []
+
+        vectors = self._cached_vectors(
+            str(row["normalized_text_hash"]) for row in rows
+        )
+        best: list[tuple[float, str, dict[str, Any]]] = []
+        for row in rows:
+            vector = vectors.get(str(row["normalized_text_hash"]))
+            if vector is None or vector.size != query_vector.size:
+                continue
+            score = float(vector @ query_vector)
+            node = self._decode_node(row)
+            key = (score, str(row["node_id"]), node)
+            if len(best) < limit:
+                heapq.heappush(best, key)
+            elif (score, str(row["node_id"])) > (best[0][0], best[0][1]):
+                heapq.heapreplace(best, key)
+        ranked = sorted(best, key=lambda item: (-item[0], item[1]))
+        return [(node, score) for score, _, node in ranked]
+
     def semantic_segment_scores(
         self,
         layer: str,
@@ -272,6 +444,14 @@ class IndexedGraphStore:
                 or self.semantic_text_selector.config.candidate_top_segments
             ),
         )
+        if self.has_semantic_segment_refs:
+            return self._semantic_segment_scores_from_refs(
+                layer,
+                identifiers,
+                query_vector,
+                requested_top_segments=requested_top_segments,
+            )
+
         model_name = str(
             self.metadata.get("semantic_model_name")
             or self.semantic_text_selector.config.model_name
@@ -315,6 +495,48 @@ class IndexedGraphStore:
             for row, value in zip(valid_rows, values, strict=True):
                 scores_by_node.setdefault(str(row["node_id"]), []).append(
                     float(value)
+                )
+
+        return {
+            node_id: (
+                sum(sorted(values, reverse=True)[:requested_top_segments])
+                / min(len(values), requested_top_segments)
+            )
+            for node_id, values in scores_by_node.items()
+            if values
+        }
+
+    def _semantic_segment_scores_from_refs(
+        self,
+        layer: str,
+        identifiers: list[str],
+        query_vector: np.ndarray,
+        *,
+        requested_top_segments: int,
+    ) -> dict[str, float]:
+        scores_by_node: dict[str, list[float]] = {}
+        for chunk in self._chunks(identifiers):
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.connection.execute(
+                f"""
+                SELECT n.node_id, r.segment_index, r.normalized_text_hash
+                  FROM semantic_segment_refs r
+                  JOIN nodes n ON n.node_pk = r.node_pk
+                 WHERE n.graph_layer = ?
+                   AND n.node_id IN ({placeholders})
+                 ORDER BY n.node_id, r.segment_index
+                """,
+                [layer, *chunk],
+            ).fetchall()
+            vectors = self._cached_vectors(
+                str(row["normalized_text_hash"]) for row in rows
+            )
+            for row in rows:
+                vector = vectors.get(str(row["normalized_text_hash"]))
+                if vector is None or vector.size != query_vector.size:
+                    continue
+                scores_by_node.setdefault(str(row["node_id"]), []).append(
+                    float(vector @ query_vector)
                 )
 
         return {
@@ -608,6 +830,15 @@ class IndexedGraphBundleStore:
                 "Manifesto de índices incompatível. "
                 f"Esperado {INDEX_BUNDLE_VERSION}, encontrado "
                 f"{self.payload.get('version')}."
+            )
+        indexed_model = str(self.payload.get("semantic_model_name") or "")
+        selected_model = str(
+            self.semantic_text_selector.config.model_name or ""
+        )
+        if indexed_model and selected_model and indexed_model != selected_model:
+            raise ValueError(
+                "O bundle foi construído com outro modelo semântico: "
+                f"bundle={indexed_model}, pesquisa={selected_model}."
             )
         indexes = self.payload.get("indexes")
         if not isinstance(indexes, dict):

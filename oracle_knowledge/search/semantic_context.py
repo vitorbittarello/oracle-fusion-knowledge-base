@@ -200,6 +200,24 @@ class SemanticTextSelector:
         )
         return self._normalize_embeddings(values)[0]
 
+    def encode_queries(self, queries: list[str]) -> np.ndarray:
+        """Codifica várias consultas em um único lote normalizado.
+
+        Esta operação cria apenas vetores efêmeros de consulta. Ela não altera
+        nem recalcula os embeddings documentais persistidos no índice.
+        """
+        if not queries:
+            return np.empty((0, 0), dtype=np.float32)
+        model = self._load_model()
+        values = model.encode(
+            [self._format_query(query) for query in queries],
+            batch_size=self.config.batch_size,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+        )
+        return self._normalize_embeddings(values)
+
     def encode_documents(self, documents: list[str]) -> np.ndarray:
         """Codifica documentos em uma matriz normalizada na ordem recebida."""
         if not documents:

@@ -6,6 +6,11 @@ A arquitetura atual evita colocar toda a documentação de um módulo em um úni
 
 Os exemplos de comando são apresentados em **Bash** e **PowerShell**. No Bash, a continuação de linha usa `\`; no PowerShell, usa crase (`` ` ``).
 
+> [!IMPORTANT]
+> **Ferramenta independente e não oficial.** Este projeto não é um produto Oracle, não possui suporte oficial da Oracle e não substitui o trabalho do **Analista Funcional Oracle Fusion**, a validação técnica, a homologação com dados reais nem os controles de segurança e governança da organização. Seu objetivo é **acelerar a descoberta de fontes e a construção de pipelines de extração de dados do Oracle Fusion Cloud Applications**, produzindo contexto rastreável para análise, SQL candidata e desenho de datasets.
+>
+> Leia também o [artigo do autor no Medium sobre o projeto](https://medium.com/p/4d524bfea5fa).
+
 ---
 
 ## 1. Objetivo
@@ -33,6 +38,8 @@ A saída principal é um contexto rastreável para apoiar:
 - perguntas para uma LLM com menos ruído documental.
 
 A ferramenta trabalha com documentação e metadados. Ela não consulta os dados transacionais do Oracle Fusion.
+
+O resultado deve ser entendido como **apoio à engenharia de dados**. Ele reduz o tempo de descoberta e organiza evidências para que uma equipe técnica e funcional possa construir, revisar e homologar pipelines de extração com menor risco de utilizar tabelas, colunas, joins, filtros ou granularidades incorretas.
 
 ---
 
@@ -78,6 +85,53 @@ A separação impede que objetos com funções diferentes disputem o mesmo ranki
 - uma pergunta OTBI não compete diretamente com uma coluna;
 - uma simples menção textual não recebe a mesma autoridade de um mapeamento curado;
 - a origem de um comportamento incorreto pode ser diagnosticada por camada.
+
+### Princípios para alta assertividade na geração do contexto
+
+A assertividade não depende apenas do modelo semântico. Ela resulta da combinação de controles estruturais, conhecimento curado e critérios conservadores de promoção:
+
+```text
+pergunta
+  → decomposição em entidade, atributos, restrições e grão
+  → módulo e comunidade estrutural
+  → rotas explícitas e proveniência
+  → candidatos locais
+  → precedência da evidência curada
+  → compatibilidade de grão
+  → contexto explicável
+```
+
+Os princípios obrigatórios são:
+
+1. **Estrutura antes de semântica.** A busca é restrita ao módulo, à entidade e à comunidade comprovada antes do fallback semântico.
+2. **Evidência forte vence score.** Mapeamentos curados, regras validadas e nomes técnicos exatos prevalecem sobre FTS5 e embeddings.
+3. **Embedding não prova equivalência funcional.** Similaridade semântica isolada gera sugestão, nunca uma coluna `resolved`.
+4. **O grão faz parte da resposta.** Uma coluna de linha não deve vencer uma coluna de cabeçalho quando o pedido exige uma linha por acordo.
+5. **Identificador não é descrição.** `VENDOR_ID` pode ser evidência parcial para Fornecedor, mas não substitui o nome do fornecedor.
+6. **Ausência de prova é explicitada.** O motor deve devolver `ambiguous` ou `unresolved`, em vez de completar lacunas por plausibilidade.
+7. **Toda decisão precisa ser rastreável.** Fonte, caminho, tipo de aresta, confiança, comunidade e critério de seleção devem aparecer no JSON explicável.
+
+### Hierarquia de evidência
+
+A ordem de precedência usada para selecionar atributos deve ser preservada pela curadoria e pelos testes:
+
+| Prioridade | Evidência | Uso esperado |
+|---:|---|---|
+| 1 | regra validada no ambiente | seleção, filtro, join, ranking e grão homologados |
+| 2 | `mapped_to_attribute` ou coluna qualificada curada | resolução determinística do atributo |
+| 3 | documentação oficial inequívoca | candidato forte com proveniência oficial |
+| 4 | nome técnico ou alias técnico exato | resolução quando não há conflito de significado |
+| 5 | correspondência lexical forte | candidato sujeito a margem e ausência de concorrentes |
+| 6 | similaridade semântica | sugestão diagnóstica; não promove sozinha |
+
+### Estados de resolução de atributos
+
+| Estado | Significado | Pode entrar automaticamente em SQL candidata? |
+|---|---|---|
+| `resolved` | há evidência forte e caminho físico compatível | sim, ainda sujeito a revisão |
+| `partial` | existe parte do caminho, normalmente um ID sem descrição | não sem completar o relacionamento |
+| `ambiguous` | há candidatos plausíveis sem evidência suficiente para escolher | não |
+| `unresolved` | não foi encontrado candidato estruturalmente válido | não |
 
 ---
 
@@ -318,11 +372,16 @@ python \
 
 ## 6. Configuração UTF-8
 
-Antes de coletas e buscas, configure a sessão:
+Todo o projeto usa UTF-8. A configuração deve ser feita **antes** de coletar, indexar ou executar buscas. Isso é especialmente importante no Windows PowerShell 5.1, cujo pipeline de processos nativos pode interpretar bytes UTF-8 usando a code page OEM.
+
+> [!WARNING]
+> `Out-File -Encoding utf8` ou `Set-Content -Encoding utf8` controlam a gravação do arquivo, mas não corrigem bytes que o PowerShell já tenha interpretado com a code page errada. Configure também `InputEncoding`, `OutputEncoding`, `$OutputEncoding`, `PYTHONUTF8` e `PYTHONIOENCODING`.
 
 #### Bash
 
 ```bash
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
 export PYTHONUTF8=1
 export PYTHONIOENCODING=utf-8
 ```
@@ -330,32 +389,47 @@ export PYTHONIOENCODING=utf-8
 #### PowerShell
 
 ```powershell
-$utf8 = [System.Text.UTF8Encoding]::new()
+chcp 65001 > $null
 
-[Console]::InputEncoding = $utf8
+$utf8 = [System.Text.UTF8Encoding]::new($false)
+
+[Console]::InputEncoding  = $utf8
 [Console]::OutputEncoding = $utf8
 $OutputEncoding = $utf8
 
 $env:PYTHONUTF8 = "1"
+$env:PYTHONIOENCODING = "utf-8"
 ```
 
-Para salvar a saída, use redirecionamento no Bash e `Out-File -Encoding utf8` no PowerShell:
+No PowerShell, prefira também executar o Python com `-X utf8`:
+
+```powershell
+& ".\.venv\Scripts\python.exe" -X utf8 build_knowledge_base.py --help
+```
+
+### Teste rápido do terminal
 
 #### Bash
 
 ```bash
-python build_knowledge_base.py --help \
-  > "./ajuda.txt"
+python -X utf8 -c 'import json; print(json.dumps({"texto": "Aquisição, Descrição, Não, inferência"}, ensure_ascii=False))' \
+  > "./teste_utf8.json"
+python -X utf8 -c 'from pathlib import Path; print(Path("teste_utf8.json").read_text(encoding="utf-8"))'
 ```
 
 #### PowerShell
 
 ```powershell
-& ".\.venv\Scripts\python.exe" build_knowledge_base.py --help |
-  Out-File `
-    -FilePath ".\ajuda.txt" `
+& ".\.venv\Scripts\python.exe" -X utf8 -c `
+  "import json; print(json.dumps({'texto': 'Aquisição, Descrição, Não, inferência'}, ensure_ascii=False))" |
+  Set-Content `
+    -Path ".\teste_utf8.json" `
     -Encoding utf8
+
+Get-Content ".\teste_utf8.json" -Raw -Encoding utf8
 ```
+
+O resultado deve preservar exatamente `Aquisição`, `Descrição`, `Não` e `inferência`. PowerShell 7+ é recomendado, mas o PowerShell 5.1 pode ser utilizado com a configuração acima.
 
 ---
 
@@ -949,14 +1023,14 @@ python build_knowledge_base.py search-federated \
 #### PowerShell
 
 ```powershell
-& ".\.venv\Scripts\python.exe" build_knowledge_base.py search-federated `
+& ".\.venv\Scripts\python.exe" -X utf8 build_knowledge_base.py search-federated `
   --graph-dir ".\data\graph\procurement_common" `
   --query "acordo de compra valor liberado fornecedor condições de pagamento" `
   --module "procurement" `
   --limit 20 `
   --max-characters 14000 |
-  Out-File `
-    -FilePath ".\resultado_federado_procurement.json" `
+  Set-Content `
+    -Path ".\resultado_federado_procurement.json" `
     -Encoding utf8
 ```
 
@@ -1078,42 +1152,99 @@ O parâmetro `--module` pode ser repetido em bundles multimódulo.
 
 ## 14. Como interpretar o resultado federado
 
-O JSON contém:
+O JSON é uma trilha de decisão, não apenas uma lista de resultados. Os blocos mais importantes são:
 
-### `query`
+### `query` e `query_diagnostics`
 
-Pergunta original.
+- pergunta recebida;
+- consulta normalizada;
+- diagnóstico de encoding;
+- correções aplicadas, quando houver;
+- marcadores ambíguos.
 
-### `context`
+### `query_plan`
 
-Texto final pronto para ser usado em uma análise ou enviado a uma LLM.
+Decomposição determinística da pergunta:
 
-### `results`
+- entidade principal;
+- atributos solicitados;
+- aliases reconhecidos;
+- restrições explícitas;
+- grão solicitado;
+- módulo candidato.
 
-Evidências selecionadas, incluindo:
+### `entity` e `community`
 
-- tipo do nó;
-- título;
-- score;
-- resumo;
-- fonte;
+Identificam a entidade escolhida e a comunidade estrutural usada para limitar a navegação. Verifique:
+
+- `community_id`;
+- estratégia;
+- nó âncora;
 - módulos;
-- evidência estruturada.
+- quantidade de membros;
+- distribuição por tipo e camada.
 
-### `characters`
+Uma comunidade muito grande pode indicar arestas globais ou relações excessivamente permissivas. Uma comunidade pequena demais pode esconder relacionamentos necessários.
 
-Quantidade real de caracteres do contexto renderizado.
+### `god_nodes`
+
+Nós estruturalmente centrais da comunidade. Eles ajudam no diagnóstico, mas não são automaticamente a resposta correta. Uma tabela com muitas colunas tende a ter alto grau local.
+
+### `attribute_evidence`
+
+É o principal bloco para avaliar a assertividade do contexto. Para cada atributo, confira:
+
+- `status`;
+- `selected_path`;
+- `alternative_paths`;
+- `evidence`;
+- `candidate_diagnostics`;
+- `grain_compatibility`;
+- `selection_basis`;
+- `resolution_confidence`;
+- `resolution_note`.
+
+Um candidato sem `promotion_eligible`, sustentado apenas por `semantic_suggestion`, não deve ser tratado como coluna confirmada.
+
+### `results` e `context`
+
+- `results` contém evidências selecionadas para o contexto;
+- `context` é o texto renderizado para análise humana ou LLM;
+- `characters` informa o orçamento efetivamente utilizado.
+
+A presença de um objeto em `results` não substitui a avaliação de `attribute_evidence`.
+
+### `gaps`
+
+Atributos `partial`, `ambiguous` ou `unresolved` que exigem curadoria, expansão de caminhos ou validação funcional. Um `gaps` vazio só é positivo quando as evidências também são fortes.
+
+### `rejected_candidates` e `semantic_candidates`
+
+Permitem verificar o que foi rejeitado pelo gating e quais candidatos vieram do fallback semântico. O fallback deve permanecer restrito à comunidade ativa.
 
 ### `routing`
 
 Diagnóstico do orquestrador:
 
-- `master_business_seeds`: conceitos de negócio reconhecidos no master;
-- `master_routes`: pontes explícitas percorridas;
-- `semantic_fallback_roots`: raízes escolhidas semanticamente quando uma camada não possuía ponte;
-- `candidate_count`: quantidade de candidatos reunidos antes do orçamento final.
+- módulos efetivos;
+- sementes de negócio;
+- rotas explícitas;
+- rotas descartadas;
+- escopo semântico;
+- diagnóstico ADF-first;
+- reutilização de embeddings;
+- quantidade de vetores de consulta;
+- tempos por etapa.
 
-O bloco `routing` é importante para diagnosticar se o resultado veio de uma curadoria explícita ou de fallback semântico.
+Os indicadores esperados em uma busca normal são:
+
+```text
+semantic_scope = active_community
+embedding_recalculated = false
+document_embeddings_recalculated = false
+```
+
+O bloco `routing` diferencia conhecimento curado, expansão estrutural, FTS5 e fallback semântico.
 
 ---
 
@@ -1163,6 +1294,130 @@ Para perguntas de negócio em português, prefira `search-federated`. Uma busca 
 ---
 
 ## 16. Curadoria
+
+A curadoria é a etapa que transforma um motor de busca estruturalmente seguro em uma base de conhecimento funcionalmente assertiva. Ela não deve ser implementada como condicionais específicas no código. O conhecimento deve ser versionado em arquivos de configuração, regras e mapeamentos, com origem e confiança explícitas.
+
+### Curadoria Oracle padrão e curadoria da implantação
+
+**Curadoria Oracle padrão** é reutilizável entre clientes e deve ser sustentada por documentação oficial, catálogos OTBI/REST ou evidência técnica inequívoca. Exemplos:
+
+```text
+Purchase Agreement → PO_HEADERS_ALL
+agreement number → PO_HEADERS_ALL.SEGMENT1
+currency → PO_HEADERS_ALL.CURRENCY_CODE
+start date → PO_HEADERS_ALL.START_DATE
+end date → PO_HEADERS_ALL.END_DATE
+creation date → PO_HEADERS_ALL.CREATION_DATE
+released amount → PO_HEADERS_ALL.AMOUNT_RELEASED
+```
+
+**Curadoria específica da implantação** depende da configuração e do uso real do ERP:
+
+- atributos flexíveis e extensíveis;
+- status e códigos usados pela organização;
+- tipos de documento e filtros locais;
+- regras de vigência e ranking;
+- relatórios homologados;
+- views Gold e integrações;
+- customizações ADF;
+- segurança e escopo de dados;
+- sistema considerado autoridade para cada informação.
+
+A ferramenta não consegue deduzir com segurança essas características apenas pela documentação pública. Elas precisam ser validadas pelo Analista Funcional e pela equipe responsável pelo dado.
+
+### Curadoria versus desenvolvimento de software
+
+| Curadoria de conhecimento | Desenvolvimento e tuning do motor |
+|---|---|
+| aliases funcionais e técnicos | algoritmo genérico de ranking |
+| entidade e atributo canônicos | structural gating |
+| coluna qualificada | expansão genérica de caminhos |
+| join e cardinalidade validados | cache e incrementalidade |
+| significado de status e códigos | performance de FTS5 e embeddings |
+| regras de vigência, filtro e ranking | compactação do JSON |
+| customizações e configuração do ambiente | observabilidade e tratamento de erros |
+| fonte, confiança e responsável pela validação | testes da infraestrutura do motor |
+
+Mapeamentos como `agreement_number → PO_HEADERS_ALL.SEGMENT1` pertencem à curadoria. Regras genéricas como “evidência curada vence similaridade semântica” pertencem ao software. Evite colocar conhecimento de uma única implantação em condicionais Python.
+
+### Conteúdo mínimo de um atributo curado
+
+O schema atual permite declarar atributos dentro da entidade em `entity_aliases.json`:
+
+```json
+{
+  "entity_id": "purchase_agreement",
+  "name": "Purchase Agreement",
+  "aliases": [
+    "acordo de compra",
+    "gerenciar acordo"
+  ],
+  "tables": [
+    "PO_HEADERS_ALL"
+  ],
+  "attributes": [
+    {
+      "attribute_id": "agreement_number",
+      "name": "Agreement Number",
+      "aliases": [
+        "acordo",
+        "número do acordo",
+        "agreement number"
+      ],
+      "description": "Número do documento do acordo de compra.",
+      "columns": [
+        "PO_HEADERS_ALL.SEGMENT1"
+      ],
+      "confidence": "high"
+    }
+  ],
+  "module_id": "procurement"
+}
+```
+
+Esse registro cria um nó `business_attribute`, a aresta `has_attribute` e, quando a coluna existir no grafo físico, a aresta `mapped_to_attribute`.
+
+### Curadoria de caminhos descritivos
+
+Mapear um ID é insuficiente quando o campo solicitado é descritivo. Exemplos que precisam de caminho validado:
+
+```text
+Fornecedor
+PO_HEADERS_ALL.VENDOR_ID
+  → POZ_SUPPLIERS
+  → HZ_PARTIES.PARTY_NAME
+```
+
+```text
+Condições de Pagamento
+PO_HEADERS_ALL.TERMS_ID
+  → tabela de condições
+  → nome da condição
+```
+
+A curadoria deve registrar:
+
+- coluna de origem;
+- tabela e coluna de destino;
+- tipo de relação;
+- propósito funcional;
+- grão antes e depois do join;
+- cardinalidade esperada;
+- fonte da evidência;
+- status da validação;
+- ambiente e data da validação.
+
+### Critérios de promoção
+
+A inclusão de um alias não deve promover qualquer candidato textual. Para um atributo ficar `resolved`, deve existir uma evidência inequívoca, como:
+
+- coluna qualificada em `attributes[].columns`;
+- regra validada;
+- nome técnico exato sem conflito;
+- documentação oficial diretamente vinculada ao atributo;
+- caminho estrutural completo e compatível com o grão.
+
+Um ID sem caminho até a descrição deve permanecer `partial`. Vários candidatos fortes sem desempate devem permanecer `ambiguous`.
 
 ### Aliases de entidades
 
@@ -1250,6 +1505,102 @@ python build_knowledge_base.py link \
   --output-dir ".\data\graph\fusion_modules"
 ```
 
+### Fluxo de publicação da curadoria
+
+Depois de alterar aliases, atributos, regras ou mapeamentos, publique o conhecimento de forma incremental.
+
+#### Bash
+
+```bash
+python -X utf8 build_knowledge_base.py link \
+  --modules-root "./data/modules" \
+  --include-default-curation \
+  --output-dir "./data/graph/fusion_modules"
+
+python -X utf8 build_knowledge_base.py build-topology \
+  --graph-dir "./data/graph/fusion_modules"
+
+python -X utf8 build_knowledge_base.py normalize-index \
+  --graph-dir "./data/graph/fusion_modules" \
+  --batch-size 1000 \
+  --checkpoint-percent 1
+
+python -X utf8 build_knowledge_base.py vectorize-index \
+  --graph-dir "./data/graph/fusion_modules" \
+  --semantic-model "intfloat/multilingual-e5-base" \
+  --semantic-device cpu \
+  --semantic-batch-size 32 \
+  --checkpoint-percent 1
+
+python -X utf8 build_knowledge_base.py build-index \
+  --graph-dir "./data/graph/fusion_modules" \
+  --layer business \
+  --layer master \
+  --semantic-model "intfloat/multilingual-e5-base"
+
+python -X utf8 build_knowledge_base.py validate-index \
+  --graph-dir "./data/graph/fusion_modules"
+```
+
+#### PowerShell
+
+```powershell
+& ".\.venv\Scripts\python.exe" -X utf8 build_knowledge_base.py link `
+  --modules-root ".\data\modules" `
+  --include-default-curation `
+  --output-dir ".\data\graph\fusion_modules"
+
+& ".\.venv\Scripts\python.exe" -X utf8 build_knowledge_base.py build-topology `
+  --graph-dir ".\data\graph\fusion_modules"
+
+& ".\.venv\Scripts\python.exe" -X utf8 build_knowledge_base.py normalize-index `
+  --graph-dir ".\data\graph\fusion_modules" `
+  --batch-size 1000 `
+  --checkpoint-percent 1
+
+& ".\.venv\Scripts\python.exe" -X utf8 build_knowledge_base.py vectorize-index `
+  --graph-dir ".\data\graph\fusion_modules" `
+  --semantic-model "intfloat/multilingual-e5-base" `
+  --semantic-device "cpu" `
+  --semantic-batch-size 32 `
+  --checkpoint-percent 1
+
+& ".\.venv\Scripts\python.exe" -X utf8 build_knowledge_base.py build-index `
+  --graph-dir ".\data\graph\fusion_modules" `
+  --layer business `
+  --layer master `
+  --semantic-model "intfloat/multilingual-e5-base"
+
+& ".\.venv\Scripts\python.exe" -X utf8 build_knowledge_base.py validate-index `
+  --graph-dir ".\data\graph\fusion_modules"
+```
+
+`normalize-index` e `vectorize-index` são incrementais: conteúdos inalterados são reutilizados. Para alterações exclusivas de código, ranking ou renderização, não execute essas etapas. Para novos atributos, aliases ou descrições, execute-as para manter o corpus semântico alinhado.
+
+### Testes de referência da curadoria
+
+Cada caso homologado deve virar um teste com:
+
+```text
+pergunta
+entidade esperada
+módulo esperado
+grão esperado
+atributos esperados
+colunas esperadas
+estado esperado por atributo
+colunas proibidas
+caminhos obrigatórios
+```
+
+A meta não é resolver tudo. A meta é obter:
+
+- zero falso positivo promovido;
+- atributos oficiais resolvidos deterministicamente;
+- IDs descritivos marcados como `partial` até o caminho ser completado;
+- ambiguidades registradas em `gaps`;
+- nenhum objeto de outro módulo ou comunidade no contexto.
+
 ---
 
 ## 17. Migração de grafo antigo
@@ -1332,20 +1683,28 @@ O módulo ainda não possui curadoria de entidades, atributos ou regras. A busca
 
 Use termos técnicos em inglês ou use `search-federated`, que resolve a linguagem de negócio no master e possui fallback semântico por camada.
 
-### Aparecem caracteres como `condi├º├Áes`
+### Aparecem caracteres como `AquisiþÒo` ou `condi├º├Áes`
 
-Configure UTF-8 na sessão e salve a saída com:
+Volte à seção [Configuração UTF-8](#6-configuração-utf-8). O problema normalmente está na fronteira entre o processo Python e o terminal, especialmente no Windows PowerShell 5.1. Apenas definir a codificação do arquivo de saída não corrige bytes já interpretados com a code page errada.
 
 #### Bash
 
 ```bash
-> arquivo.json
+python -X utf8 build_knowledge_base.py search-federated \
+  --graph-dir "./data/graph/fusion_modules" \
+  --query "Aquisição, Descrição, Condições de Pagamento" \
+  > "./resultado_utf8.json"
 ```
 
 #### PowerShell
 
 ```powershell
-Out-File -Encoding utf8
+& ".\.venv\Scripts\python.exe" -X utf8 build_knowledge_base.py search-federated `
+  --graph-dir ".\data\graph\fusion_modules" `
+  --query "Aquisição, Descrição, Condições de Pagamento" |
+  Set-Content `
+    -Path ".\resultado_utf8.json" `
+    -Encoding utf8
 ```
 
 Também verifique se os arquivos de curadoria foram gravados em UTF-8.
@@ -1664,13 +2023,27 @@ data/environment/adf/
 ```
 
 As credenciais são fornecidas por variáveis de ambiente. O comando não solicita
-senha interativamente:
+senha interativamente.
+
+#### Bash
+
+```bash
+export FUSION_USERNAME="seu.usuario"
+export FUSION_PASSWORD="senha-do-processo-atual"
+
+python -X utf8 build_knowledge_base.py collect-adf \
+  --base-url "https://seu-ambiente.fa.regiao.oraclecloud.com" \
+  --output-dir "./data/environment/adf" \
+  --custom-only
+```
+
+#### PowerShell
 
 ```powershell
 $env:FUSION_USERNAME = "seu.usuario"
 $env:FUSION_PASSWORD = "senha-do-processo-atual"
 
-python build_knowledge_base.py collect-adf `
+& ".\.venv\Scripts\python.exe" -X utf8 build_knowledge_base.py collect-adf `
   --base-url "https://seu-ambiente.fa.regiao.oraclecloud.com" `
   --output-dir ".\data\environment\adf" `
   --custom-only
@@ -1696,17 +2069,37 @@ Uma projeção explícita por módulo usa apenas os nomes dos recursos globais:
 
 Validação do catálogo global:
 
+#### Bash
+
+```bash
+python -X utf8 build_knowledge_base.py validate-adf \
+  --adf-dir "./data/environment/adf"
+```
+
+#### PowerShell
+
 ```powershell
-python build_knowledge_base.py validate-adf `
+& ".\.venv\Scripts\python.exe" -X utf8 build_knowledge_base.py validate-adf `
   --adf-dir ".\data\environment\adf"
 ```
 
 O comando `link` procura automaticamente
 `data/environment/adf/catalog.json` quando `--modules-root` aponta para
-`data/modules`:
+`data/modules`.
+
+#### Bash
+
+```bash
+python -X utf8 build_knowledge_base.py link \
+  --modules-root "./data/modules" \
+  --include-default-curation \
+  --output-dir "./data/graph/fusion_modules"
+```
+
+#### PowerShell
 
 ```powershell
-python build_knowledge_base.py link `
+& ".\.venv\Scripts\python.exe" -X utf8 build_knowledge_base.py link `
   --modules-root ".\data\modules" `
   --include-default-curation `
   --output-dir ".\data\graph\fusion_modules"
@@ -1736,8 +2129,19 @@ Antes da vetorização, o corpus semântico pode ser preparado com o comando
 
 Exemplo:
 
+#### Bash
+
+```bash
+python -X utf8 -u build_knowledge_base.py normalize-index \
+  --graph-dir "./data/graph/fusion_modules" \
+  --batch-size 1000 \
+  --checkpoint-percent 1
+```
+
+#### PowerShell
+
 ```powershell
-& ".\.venv\Scripts\python.exe" -u build_knowledge_base.py normalize-index `
+& ".\.venv\Scripts\python.exe" -X utf8 -u build_knowledge_base.py normalize-index `
   --graph-dir ".\data\graph\fusion_modules" `
   --batch-size 1000 `
   --checkpoint-percent 1
@@ -1758,8 +2162,18 @@ a durabilidade. Após `Ctrl+C`, basta repetir o mesmo comando para retomar do
 
 Para iniciar um novo run sem apagar o cache normalizado:
 
+#### Bash
+
+```bash
+python -X utf8 -u build_knowledge_base.py normalize-index \
+  --graph-dir "./data/graph/fusion_modules" \
+  --no-resume
+```
+
+#### PowerShell
+
 ```powershell
-& ".\.venv\Scripts\python.exe" -u build_knowledge_base.py normalize-index `
+& ".\.venv\Scripts\python.exe" -X utf8 -u build_knowledge_base.py normalize-index `
   --graph-dir ".\data\graph\fusion_modules" `
   --no-resume
 ```
@@ -1772,10 +2186,23 @@ canonicalizados globalmente.
 
 Depois de concluir `normalize-index`, vetorize somente os textos normalizados
 únicos com `vectorize-index`. O modelo base é o padrão e pode ser informado
-explicitamente:
+explicitamente.
+
+#### Bash
+
+```bash
+python -X utf8 -u build_knowledge_base.py vectorize-index \
+  --graph-dir "./data/graph/fusion_modules" \
+  --semantic-model "intfloat/multilingual-e5-base" \
+  --semantic-device cpu \
+  --semantic-batch-size 32 \
+  --checkpoint-percent 1
+```
+
+#### PowerShell
 
 ```powershell
-& ".\.venv\Scripts\python.exe" -u build_knowledge_base.py vectorize-index `
+& ".\.venv\Scripts\python.exe" -X utf8 -u build_knowledge_base.py vectorize-index `
   --graph-dir ".\data\graph\fusion_modules" `
   --semantic-model "intfloat/multilingual-e5-base" `
   --semantic-device "cpu" `
@@ -1792,8 +2219,21 @@ documento: passage: <texto normalizado>
 
 Para usar o modelo maior:
 
+#### Bash
+
+```bash
+python -X utf8 -u build_knowledge_base.py vectorize-index \
+  --graph-dir "./data/graph/fusion_modules" \
+  --semantic-model "intfloat/multilingual-e5-large-instruct" \
+  --semantic-device cuda \
+  --semantic-batch-size 32 \
+  --checkpoint-percent 1
+```
+
+#### PowerShell
+
 ```powershell
-& ".\.venv\Scripts\python.exe" -u build_knowledge_base.py vectorize-index `
+& ".\.venv\Scripts\python.exe" -X utf8 -u build_knowledge_base.py vectorize-index `
   --graph-dir ".\data\graph\fusion_modules" `
   --semantic-model "intfloat/multilingual-e5-large-instruct" `
   --semantic-device "cuda" `
@@ -1835,10 +2275,22 @@ A vetorização é:
 - observável: o log apresenta percentual, contagens, dimensão e ETA aproximada.
 
 O mesmo modelo deve ser usado em `vectorize-index`, `build-index` e
-`search-federated`. Exemplo de busca com o perfil base:
+`search-federated`. Exemplo de busca com o perfil base.
+
+#### Bash
+
+```bash
+python -X utf8 -u build_knowledge_base.py search-federated \
+  --graph-dir "./data/graph/fusion_modules" \
+  --query "acordos de compra e fornecedor" \
+  --semantic-model "intfloat/multilingual-e5-base" \
+  --semantic-device cpu
+```
+
+#### PowerShell
 
 ```powershell
-& ".\.venv\Scripts\python.exe" -u build_knowledge_base.py search-federated `
+& ".\.venv\Scripts\python.exe" -X utf8 -u build_knowledge_base.py search-federated `
   --graph-dir ".\data\graph\fusion_modules" `
   --query "acordos de compra e fornecedor" `
   --semantic-model "intfloat/multilingual-e5-base" `
@@ -1860,3 +2312,77 @@ reutilizados=0 | dimensões=768 | ETA 03:42:10 | checkpoint persistido.
 Após `Ctrl+C`, repita o mesmo comando. Para iniciar outro run preservando o
 cache compatível, use `--no-resume`. Para descartar e recalcular os vetores do
 perfil atual, use `--force-revectorize`.
+
+## Roteamento topológico explicável
+
+A busca federada preserva a arquitetura híbrida existente e acrescenta uma camada topológica compartilhada entre os perfis semânticos. O fluxo é: diagnóstico de encoding, decomposição da pergunta, roteamento ADF/business, seleção de comunidade estrutural, uso de `god_nodes`, busca de caminhos tipados por atributo, expansão por proveniência e bloqueio de candidatos desconectados. FTS e embeddings continuam sendo mecanismos de recuperação; eles não criam comunidades nem relações.
+
+As comunidades são vizinhanças estruturais determinísticas centradas em entidades de negócio. Apenas bridges explícitas e arestas `VALIDATED` ou `EXTRACTED` participam da derivação; ligações genéricas como `belongs_to_module` não unem domínios. O catálogo `topology_catalog.json` registra assinatura do grafo, versão do algoritmo, memberships sobrepostos quando necessários e centralidade local (`weighted_local_degree_v2`). Colunas de auditoria e nós técnicos genéricos recebem penalização para não dominarem os `god_nodes`.
+
+#### Bash
+
+```bash
+python -X utf8 build_knowledge_base.py build-topology \
+  --graph-dir "./data/graph/fusion_modules"
+
+python -X utf8 build_knowledge_base.py build-index \
+  --graph-dir "./data/graph/fusion_modules" \
+  --semantic-model "intfloat/multilingual-e5-base"
+
+python -X utf8 build_knowledge_base.py validate-index \
+  --graph-dir "./data/graph/fusion_modules"
+
+python -X utf8 build_knowledge_base.py search-federated \
+  --graph-dir "./data/graph/fusion_modules" \
+  --semantic-model "intfloat/multilingual-e5-base" \
+  --query "acordo de compra com fornecedor, valor liberado e condições de pagamento" \
+  > "./resultado_topologia.json"
+```
+
+#### PowerShell
+
+```powershell
+& ".\.venv\Scripts\python.exe" -X utf8 build_knowledge_base.py build-topology `
+  --graph-dir ".\data\graph\fusion_modules"
+
+& ".\.venv\Scripts\python.exe" -X utf8 build_knowledge_base.py build-index `
+  --graph-dir ".\data\graph\fusion_modules" `
+  --semantic-model "intfloat/multilingual-e5-base"
+
+& ".\.venv\Scripts\python.exe" -X utf8 build_knowledge_base.py validate-index `
+  --graph-dir ".\data\graph\fusion_modules"
+
+& ".\.venv\Scripts\python.exe" -X utf8 build_knowledge_base.py search-federated `
+  --graph-dir ".\data\graph\fusion_modules" `
+  --semantic-model "intfloat/multilingual-e5-base" `
+  --query "acordo de compra com fornecedor, valor liberado e condições de pagamento" |
+  Set-Content `
+    -Path ".\resultado_topologia.json" `
+    -Encoding utf8
+```
+
+O JSON da pesquisa inclui `query_diagnostics`, `query_plan`, uma síntese compacta da `community`, `god_nodes`, `attribute_evidence`, `semantic_candidates`, `rejected_candidates`, `gaps` e diagnóstico ADF-first. O structural gating ocorre antes da renderização, portanto candidatos rejeitados não entram em `results` nem no contexto final. O fallback semântico fica restrito à comunidade ativa e utiliza os vetores persistidos; alterar apenas query planning, topologia ou gating não exige executar `normalize-index` ou `vectorize-index` novamente.
+
+Limitação atual: a decomposição é determinística e baseada no conteúdo efetivamente presente nos grafos. Atributos ou relações ausentes são retornados como lacunas, sem criação de tabelas, colunas, joins, filtros ou significados.
+
+## Critérios de aceite para contexto de alta assertividade
+
+Antes de usar o contexto para construir uma extração, confirme:
+
+- a entidade principal representa o objeto funcional solicitado;
+- o módulo e a comunidade estão corretos;
+- cada atributo possui estado coerente;
+- candidatos `semantic_suggestion` não foram promovidos;
+- a coluna selecionada possui mapeamento curado, evidência oficial ou nome técnico inequívoco;
+- o grão da tabela é compatível com o grão solicitado;
+- joins descritivos possuem caminho completo e cardinalidade conhecida;
+- filtros e significados de códigos vêm de regra validada ou documentação;
+- `gaps` foi revisado pelo Analista Funcional;
+- a SQL candidata foi validada com dados reais;
+- a curadoria confirmada foi versionada e coberta por testes.
+
+O projeto deve ser usado para acelerar o ciclo de descoberta e engenharia, não para eliminar a responsabilidade de análise e homologação.
+
+## Referência externa
+
+- [Artigo do autor no Medium sobre o Oracle Fusion Knowledge Base](https://medium.com/p/4d524bfea5fa)

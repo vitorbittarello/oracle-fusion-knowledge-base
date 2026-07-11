@@ -15,16 +15,22 @@ from oracle_knowledge.linker.graph_layers import GRAPH_FILENAMES
 from oracle_knowledge.search.semantic_context import (
     DEFAULT_EMBEDDING_MODEL,
     SemanticTextSelector,
+    resolve_embedding_model_profile,
 )
 from oracle_knowledge.search.semantic_documents import semantic_document_text
+from oracle_knowledge.semantic_index_cache import (
+    SemanticEmbeddingCacheInfo,
+    populate_semantic_index_from_cache,
+)
 
-INDEX_SCHEMA_VERSION = "4.0.0"
-INDEX_USER_VERSION = 4
-SUPPORTED_INDEX_SCHEMA_VERSIONS = {"2.0.0", "3.0.0", INDEX_SCHEMA_VERSION}
+INDEX_SCHEMA_VERSION = "5.0.0"
+INDEX_USER_VERSION = 5
+SUPPORTED_INDEX_SCHEMA_VERSIONS = {"2.0.0", "3.0.0", "4.0.0", INDEX_SCHEMA_VERSION}
 INDEX_BUNDLE_VERSION = "1.0.0"
 DEFAULT_INDEX_DIRECTORY_RELATIVE_PATH = Path("search_index")
 DEFAULT_INDEX_RELATIVE_PATH = DEFAULT_INDEX_DIRECTORY_RELATIVE_PATH / "knowledge_index.sqlite"
 DEFAULT_INDEX_BUNDLE_RELATIVE_PATH = DEFAULT_INDEX_DIRECTORY_RELATIVE_PATH / "index_bundle.json"
+MODEL_INDEX_DIRECTORY_NAME = "models"
 LAYER_INDEX_FILENAMES = {
     layer: f"{layer}.sqlite"
     for layer in GRAPH_FILENAMES
@@ -40,6 +46,8 @@ REQUIRED_SQL_INDEXES = {
     "idx_edges_type",
     "idx_semantic_roots_model",
     "idx_semantic_segments_model",
+    "idx_semantic_root_refs_hash",
+    "idx_semantic_segment_refs_hash",
 }
 
 
@@ -141,29 +149,109 @@ def default_index_path(graph_dir: str | Path) -> Path:
     return Path(graph_dir).resolve() / DEFAULT_INDEX_RELATIVE_PATH
 
 
-def default_index_bundle_path(graph_dir: str | Path) -> Path:
-    return Path(graph_dir).resolve() / DEFAULT_INDEX_BUNDLE_RELATIVE_PATH
+def embedding_model_index_key(model_name: str) -> str:
+    """Nome estável e seguro do diretório de índices de um modelo."""
+    try:
+        return resolve_embedding_model_profile(model_name).name
+    except ValueError:
+        return "".join(
+            character if character.isalnum() or character in {"-", "_"} else "-"
+            for character in model_name
+        ).strip("-") or "semantic-model"
 
 
-def default_layer_index_path(graph_dir: str | Path, layer: str) -> Path:
-    if layer not in LAYER_INDEX_FILENAMES:
-        raise ValueError(f"Camada de índice desconhecida: {layer}")
+def default_model_index_directory(
+    graph_dir: str | Path,
+    model_name: str,
+) -> Path:
     return (
         Path(graph_dir).resolve()
         / DEFAULT_INDEX_DIRECTORY_RELATIVE_PATH
-        / LAYER_INDEX_FILENAMES[layer]
+        / MODEL_INDEX_DIRECTORY_NAME
+        / embedding_model_index_key(model_name)
     )
+
+
+def default_index_bundle_path(
+    graph_dir: str | Path,
+    model_name: str | None = None,
+) -> Path:
+    if model_name is not None:
+        return default_model_index_directory(graph_dir, model_name) / "index_bundle.json"
+    return Path(graph_dir).resolve() / DEFAULT_INDEX_BUNDLE_RELATIVE_PATH
+
+
+def default_layer_index_path(
+    graph_dir: str | Path,
+    layer: str,
+    model_name: str | None = None,
+) -> Path:
+    if layer not in LAYER_INDEX_FILENAMES:
+        raise ValueError(f"Camada de índice desconhecida: {layer}")
+    directory = (
+        default_model_index_directory(graph_dir, model_name)
+        if model_name is not None
+        else Path(graph_dir).resolve() / DEFAULT_INDEX_DIRECTORY_RELATIVE_PATH
+    )
+    return directory / LAYER_INDEX_FILENAMES[layer]
+
+
+def _bundle_matches_model(path: Path, model_name: str) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        payload = read_index_bundle(path)
+    except ValueError:
+        return False
+    return str(payload.get("semantic_model_name") or "") == model_name
+
+
+def _legacy_index_matches_model(path: Path, model_name: str) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        connection = sqlite3.connect(
+            f"file:{path.as_posix()}?mode=ro",
+            uri=True,
+        )
+        try:
+            metadata = read_index_metadata(connection)
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return False
+    return str(metadata.get("semantic_model_name") or "") == model_name
 
 
 def resolve_index_source(
     graph_dir: str | Path,
     index_path: str | Path | None = None,
+    *,
+    model_name: str | None = None,
 ) -> Path:
     if index_path is not None:
         candidate = Path(index_path).resolve()
         if candidate.is_dir():
             return candidate / "index_bundle.json"
         return candidate
+
+    if model_name is not None:
+        model_bundle = default_index_bundle_path(graph_dir, model_name)
+        if model_bundle.is_file():
+            return model_bundle
+
+        legacy_bundle = default_index_bundle_path(graph_dir)
+        if _bundle_matches_model(legacy_bundle, model_name):
+            return legacy_bundle
+
+        legacy_index = default_index_path(graph_dir)
+        if _legacy_index_matches_model(legacy_index, model_name):
+            return legacy_index
+
+        # Retorna o caminho esperado do perfil para que a mensagem de erro seja
+        # precisa e não aponte para um índice de outro modelo.
+        return model_bundle
+
     bundle_path = default_index_bundle_path(graph_dir)
     if bundle_path.is_file():
         return bundle_path
@@ -226,7 +314,7 @@ def _configure_build_connection(connection: sqlite3.Connection) -> None:
 def _create_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
-        PRAGMA user_version = 4;
+        PRAGMA user_version = 5;
 
         CREATE TABLE index_metadata (
             key TEXT PRIMARY KEY,
@@ -313,6 +401,22 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             FOREIGN KEY (node_pk) REFERENCES nodes(node_pk) ON DELETE CASCADE
         ) WITHOUT ROWID;
 
+        CREATE TABLE semantic_root_refs (
+            node_pk INTEGER PRIMARY KEY,
+            normalization_version TEXT NOT NULL,
+            normalized_text_hash TEXT NOT NULL,
+            FOREIGN KEY (node_pk) REFERENCES nodes(node_pk) ON DELETE CASCADE
+        ) WITHOUT ROWID;
+
+        CREATE TABLE semantic_segment_refs (
+            node_pk INTEGER NOT NULL,
+            segment_index INTEGER NOT NULL,
+            normalization_version TEXT NOT NULL,
+            normalized_text_hash TEXT NOT NULL,
+            PRIMARY KEY (node_pk, segment_index),
+            FOREIGN KEY (node_pk) REFERENCES nodes(node_pk) ON DELETE CASCADE
+        ) WITHOUT ROWID;
+
         CREATE INDEX idx_nodes_layer_type
             ON nodes(graph_layer, node_type);
         CREATE INDEX idx_nodes_layer_title
@@ -332,6 +436,14 @@ def _create_schema(connection: sqlite3.Connection) -> None:
             ON semantic_roots(model_name, dimensions);
         CREATE INDEX idx_semantic_segments_model
             ON semantic_segments(model_name, dimensions, node_pk);
+        CREATE INDEX idx_semantic_root_refs_hash
+            ON semantic_root_refs(normalization_version, normalized_text_hash);
+        CREATE INDEX idx_semantic_segment_refs_hash
+            ON semantic_segment_refs(
+                normalization_version,
+                normalized_text_hash,
+                node_pk
+            );
         """
     )
 
@@ -1143,6 +1255,7 @@ def _build_index_for_layers(
     semantic_batch_size: int,
     progress: Callable[[str], None] | None,
     reuse_index_path: str | Path | None = None,
+    semantic_embedding_cache: SemanticEmbeddingCacheInfo | None = None,
 ) -> IndexBuildResult:
     if batch_size <= 0:
         raise ValueError("batch_size deve ser maior que zero")
@@ -1212,74 +1325,107 @@ def _build_index_for_layers(
                     )
 
             if include_semantic_embeddings:
-                selector = semantic_text_selector or SemanticTextSelector()
-                model_name = selector.config.model_name or DEFAULT_EMBEDDING_MODEL
-                reusable_roots = _load_reusable_semantic_roots(
-                    reuse_index_path,
-                    model_name=model_name,
-                )
-                if progress:
-                    if reusable_roots:
+                if semantic_embedding_cache is not None:
+                    if progress:
                         progress(
-                            "[INDEX] Construindo índice semântico das raízes "
-                            f"com {len(reusable_roots)} vetores reutilizáveis..."
+                            "[INDEX] Associando embeddings persistidos do perfil "
+                            f"{semantic_embedding_cache.model_name} ao índice..."
                         )
-                    else:
-                        progress("[INDEX] Construindo índice semântico das raízes...")
-                (
-                    semantic_root_count,
-                    semantic_dimensions,
-                    semantic_model_name,
-                    reused_semantic_root_count,
-                    generated_semantic_root_count,
-                ) = _build_semantic_root_index(
-                    connection,
-                    selector,
-                    batch_size=semantic_batch_size,
-                    progress=progress,
-                    reusable_roots=reusable_roots,
-                )
-                semantic_segment_profile = _semantic_segment_profile(selector)
-                reusable_segments = _load_reusable_semantic_segments(
-                    reuse_index_path,
-                    model_name=model_name,
-                    profile=semantic_segment_profile,
-                )
-                if progress:
-                    if reusable_segments:
-                        progress(
-                            "[INDEX] Construindo segmentos semânticos persistidos "
-                            f"com {len(reusable_segments)} nós reutilizáveis..."
-                        )
-                    else:
-                        progress(
-                            "[INDEX] Construindo segmentos semânticos persistidos..."
-                        )
-                (
-                    semantic_segment_count,
-                    semantic_segment_node_count,
-                    segment_dimensions,
-                    segment_model_name,
-                    reused_semantic_segment_count,
-                    generated_semantic_segment_count,
-                ) = _build_semantic_segment_index(
-                    connection,
-                    selector,
-                    batch_size=semantic_batch_size,
-                    progress=progress,
-                    reusable_segments=reusable_segments,
-                )
-                if semantic_dimensions is None:
-                    semantic_dimensions = segment_dimensions
-                elif (
-                    segment_dimensions is not None
-                    and semantic_dimensions != segment_dimensions
-                ):
-                    raise RuntimeError(
-                        "As raízes e os segmentos semânticos possuem dimensões "
-                        "incompatíveis."
+                    cached = populate_semantic_index_from_cache(
+                        connection,
+                        semantic_embedding_cache,
+                        layers=normalized_layers,
+                        progress=progress,
                     )
-                semantic_model_name = semantic_model_name or segment_model_name
+                    semantic_root_count = cached.semantic_root_count
+                    semantic_segment_count = cached.semantic_segment_count
+                    semantic_segment_node_count = cached.semantic_segment_node_count
+                    semantic_dimensions = cached.dimensions
+                    semantic_model_name = cached.model_name
+                    reused_semantic_root_count = semantic_root_count
+                    reused_semantic_segment_count = semantic_segment_count
+                    semantic_segment_profile = {
+                        "version": SEMANTIC_SEGMENT_PROFILE_VERSION,
+                        "normalization_version": (
+                            semantic_embedding_cache.normalization_version
+                        ),
+                        "segmentation_version": (
+                            semantic_embedding_cache.segmentation_version
+                        ),
+                        "embedding_profile_version": (
+                            semantic_embedding_cache.embedding_profile_version
+                        ),
+                        "source": "semantic_embedding_cache",
+                    }
+                else:
+                    selector = semantic_text_selector or SemanticTextSelector()
+                    model_name = selector.config.model_name or DEFAULT_EMBEDDING_MODEL
+                    reusable_roots = _load_reusable_semantic_roots(
+                        reuse_index_path,
+                        model_name=model_name,
+                    )
+                    if progress:
+                        if reusable_roots:
+                            progress(
+                                "[INDEX] Construindo índice semântico das raízes "
+                                f"com {len(reusable_roots)} vetores reutilizáveis..."
+                            )
+                        else:
+                            progress("[INDEX] Construindo índice semântico das raízes...")
+                    (
+                        semantic_root_count,
+                        semantic_dimensions,
+                        semantic_model_name,
+                        reused_semantic_root_count,
+                        generated_semantic_root_count,
+                    ) = _build_semantic_root_index(
+                        connection,
+                        selector,
+                        batch_size=semantic_batch_size,
+                        progress=progress,
+                        reusable_roots=reusable_roots,
+                    )
+                    semantic_segment_profile = _semantic_segment_profile(selector)
+                    reusable_segments = _load_reusable_semantic_segments(
+                        reuse_index_path,
+                        model_name=model_name,
+                        profile=semantic_segment_profile,
+                    )
+                    if progress:
+                        if reusable_segments:
+                            progress(
+                                "[INDEX] Construindo segmentos semânticos persistidos "
+                                f"com {len(reusable_segments)} nós reutilizáveis..."
+                            )
+                        else:
+                            progress(
+                                "[INDEX] Construindo segmentos semânticos persistidos..."
+                            )
+                    (
+                        semantic_segment_count,
+                        semantic_segment_node_count,
+                        segment_dimensions,
+                        segment_model_name,
+                        reused_semantic_segment_count,
+                        generated_semantic_segment_count,
+                    ) = _build_semantic_segment_index(
+                        connection,
+                        selector,
+                        batch_size=semantic_batch_size,
+                        progress=progress,
+                        reusable_segments=reusable_segments,
+                    )
+                    if semantic_dimensions is None:
+                        semantic_dimensions = segment_dimensions
+                    elif (
+                        segment_dimensions is not None
+                        and semantic_dimensions != segment_dimensions
+                    ):
+                        raise RuntimeError(
+                            "As raízes e os segmentos semânticos possuem dimensões "
+                            "incompatíveis."
+                        )
+                    semantic_model_name = semantic_model_name or segment_model_name
 
             metadata: dict[str, Any] = {
                 "schema_version": INDEX_SCHEMA_VERSION,
@@ -1302,6 +1448,11 @@ def _build_index_for_layers(
                 "generated_semantic_root_count": generated_semantic_root_count,
                 "reused_semantic_segment_count": reused_semantic_segment_count,
                 "generated_semantic_segment_count": generated_semantic_segment_count,
+                "semantic_embedding_cache": (
+                    semantic_embedding_cache.to_dict()
+                    if semantic_embedding_cache is not None
+                    else None
+                ),
             }
             if index_mode == "monolithic":
                 metadata["graph_bundle"] = _graph_bundle_info(graph_root)
@@ -1359,6 +1510,7 @@ def build_search_index(
     semantic_text_selector: SemanticTextSelector | None = None,
     semantic_batch_size: int = 32,
     progress: Callable[[str], None] | None = None,
+    semantic_embedding_cache: SemanticEmbeddingCacheInfo | None = None,
 ) -> IndexBuildResult:
     """Constrói o índice monolítico legado, mantido para compatibilidade."""
     graph_root = Path(graph_dir).resolve()
@@ -1373,6 +1525,7 @@ def build_search_index(
         semantic_text_selector=semantic_text_selector,
         semantic_batch_size=semantic_batch_size,
         progress=progress,
+        semantic_embedding_cache=semantic_embedding_cache,
     )
 
 
@@ -1387,6 +1540,7 @@ def build_layer_search_index(
     semantic_batch_size: int = 32,
     progress: Callable[[str], None] | None = None,
     reuse_index_path: str | Path | None = None,
+    semantic_embedding_cache: SemanticEmbeddingCacheInfo | None = None,
 ) -> IndexBuildResult:
     graph_root = Path(graph_dir).resolve()
     index_path = (
@@ -1405,6 +1559,7 @@ def build_layer_search_index(
         semantic_batch_size=semantic_batch_size,
         progress=progress,
         reuse_index_path=reuse_index_path,
+        semantic_embedding_cache=semantic_embedding_cache,
     )
 
 
@@ -1412,6 +1567,7 @@ def _bundle_entry_from_result(
     result: IndexBuildResult,
     *,
     bundle_dir: Path,
+    semantic_embedding_cache: SemanticEmbeddingCacheInfo | None = None,
 ) -> dict[str, Any]:
     graph_file = result.graph_files[0]
     try:
@@ -1441,6 +1597,21 @@ def _bundle_entry_from_result(
         "generated_semantic_root_count": result.generated_semantic_root_count,
         "reused_semantic_segment_count": result.reused_semantic_segment_count,
         "generated_semantic_segment_count": result.generated_semantic_segment_count,
+        "normalization_signature": (
+            semantic_embedding_cache.normalization_signature
+            if semantic_embedding_cache is not None
+            else None
+        ),
+        "embedding_profile_version": (
+            semantic_embedding_cache.embedding_profile_version
+            if semantic_embedding_cache is not None
+            else None
+        ),
+        "storage_dtype": (
+            semantic_embedding_cache.storage_dtype
+            if semantic_embedding_cache is not None
+            else None
+        ),
         "built_at": utc_now_iso(),
     }
 
@@ -1506,15 +1677,28 @@ def build_index_bundle(
     progress: Callable[[str], None] | None = None,
     force: bool = False,
     reuse_embeddings: bool = True,
+    semantic_embedding_cache: SemanticEmbeddingCacheInfo | None = None,
 ) -> IndexBundleBuildResult:
     graph_root = Path(graph_dir).resolve()
     if not graph_root.is_dir():
         raise FileNotFoundError(f"Diretório de grafos não encontrado: {graph_root}")
     requested_layers = _normalize_layers(layers)
+    selected_model_name = (
+        semantic_embedding_cache.model_name
+        if semantic_embedding_cache is not None
+        else (
+            (semantic_text_selector or SemanticTextSelector()).config.model_name
+            or DEFAULT_EMBEDDING_MODEL
+        )
+    )
     bundle_dir = (
         Path(output_dir).resolve()
         if output_dir is not None
-        else graph_root / DEFAULT_INDEX_DIRECTORY_RELATIVE_PATH
+        else (
+            default_model_index_directory(graph_root, selected_model_name)
+            if semantic_embedding_cache is not None
+            else graph_root / DEFAULT_INDEX_DIRECTORY_RELATIVE_PATH
+        )
     )
     bundle_dir.mkdir(parents=True, exist_ok=True)
     bundle_path = bundle_dir / "index_bundle.json"
@@ -1534,10 +1718,54 @@ def build_index_bundle(
     }
 
     selector = semantic_text_selector or SemanticTextSelector()
-    semantic_model_name = selector.config.model_name or DEFAULT_EMBEDDING_MODEL
+    semantic_model_name = selected_model_name
     legacy_index = default_index_path(graph_root)
     built_layers: list[str] = []
     skipped_layers: list[str] = []
+    graph_bundle = _graph_bundle_info(graph_root)
+
+    def persist_bundle(status: str) -> dict[str, Any]:
+        payload = {
+            "version": INDEX_BUNDLE_VERSION,
+            "schema_version": INDEX_SCHEMA_VERSION,
+            "generated_at": utc_now_iso(),
+            "graph_dir": str(graph_root),
+            "graph_bundle": graph_bundle,
+            "semantic_model_name": (
+                semantic_model_name if include_semantic_embeddings else None
+            ),
+            "semantic_dimensions": (
+                semantic_embedding_cache.dimensions
+                if semantic_embedding_cache is not None
+                else None
+            ),
+            "embedding_profile_version": (
+                semantic_embedding_cache.embedding_profile_version
+                if semantic_embedding_cache is not None
+                else None
+            ),
+            "normalization_signature": (
+                semantic_embedding_cache.normalization_signature
+                if semantic_embedding_cache is not None
+                else None
+            ),
+            "status": status,
+            "requested_layers": list(requested_layers),
+            "built_layers": list(built_layers),
+            "skipped_layers": list(skipped_layers),
+            "indexes": {
+                current_layer: indexes[current_layer]
+                for current_layer in GRAPH_FILENAMES
+                if current_layer in indexes
+            },
+        }
+        temporary_bundle = bundle_path.with_suffix(bundle_path.suffix + ".tmp")
+        temporary_bundle.write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temporary_bundle, bundle_path)
+        return payload
 
     for layer in requested_layers:
         graph_path = graph_root / GRAPH_FILENAMES[layer]
@@ -1549,12 +1777,24 @@ def build_index_bundle(
         existing_layer_path = (
             _resolve_bundle_entry_path(bundle_dir, entry)
             if entry is not None
-            else default_layer_index_path(graph_root, layer)
+            else bundle_dir / LAYER_INDEX_FILENAMES[layer]
         )
         semantic_expected = include_semantic_embeddings and _layer_requires_semantic_embeddings(layer)
         model_matches = (
             not semantic_expected
             or str((entry or {}).get("semantic_model_name") or "") == semantic_model_name
+        )
+        cache_matches = (
+            not semantic_expected
+            or semantic_embedding_cache is None
+            or (
+                str((entry or {}).get("normalization_signature") or "")
+                == semantic_embedding_cache.normalization_signature
+                and str((entry or {}).get("embedding_profile_version") or "")
+                == semantic_embedding_cache.embedding_profile_version
+                and int((entry or {}).get("semantic_dimensions") or 0)
+                == semantic_embedding_cache.dimensions
+            )
         )
         unchanged = bool(
             not force
@@ -1563,6 +1803,7 @@ def build_index_bundle(
             and str(entry.get("schema_version") or "") == INDEX_SCHEMA_VERSION
             and str(entry.get("graph_sha256") or "") == graph_hash
             and model_matches
+            and cache_matches
         )
 
         if unchanged:
@@ -1588,6 +1829,7 @@ def build_index_bundle(
                 progress(
                     f"[INDEX] {layer}: conteúdo inalterado; índice reutilizado sem rebuild."
                 )
+            persist_bundle("building")
             continue
 
         output_path = bundle_dir / LAYER_INDEX_FILENAMES[layer]
@@ -1608,12 +1850,19 @@ def build_index_bundle(
             semantic_batch_size=semantic_batch_size,
             progress=progress,
             reuse_index_path=reuse_index_path,
+            semantic_embedding_cache=(
+                semantic_embedding_cache if semantic_expected else None
+            ),
         )
         indexes[layer] = _bundle_entry_from_result(
             result,
             bundle_dir=bundle_dir,
+            semantic_embedding_cache=(
+                semantic_embedding_cache if semantic_expected else None
+            ),
         )
         built_layers.append(layer)
+        persist_bundle("building")
 
     for layer, entry in list(indexes.items()):
         if layer not in GRAPH_FILENAMES or not isinstance(entry, dict):
@@ -1623,26 +1872,7 @@ def build_index_bundle(
         if not index_file.is_file():
             indexes.pop(layer, None)
 
-    graph_bundle = _graph_bundle_info(graph_root)
-    payload = {
-        "version": INDEX_BUNDLE_VERSION,
-        "schema_version": INDEX_SCHEMA_VERSION,
-        "generated_at": utc_now_iso(),
-        "graph_dir": str(graph_root),
-        "graph_bundle": graph_bundle,
-        "semantic_model_name": semantic_model_name if include_semantic_embeddings else None,
-        "indexes": {
-            layer: indexes[layer]
-            for layer in GRAPH_FILENAMES
-            if layer in indexes
-        },
-    }
-    temporary_bundle = bundle_path.with_suffix(bundle_path.suffix + ".tmp")
-    temporary_bundle.write_text(
-        json.dumps(payload, indent=2, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary_bundle, bundle_path)
+    payload = persist_bundle("completed")
 
     return IndexBundleBuildResult(
         graph_dir=graph_root,
